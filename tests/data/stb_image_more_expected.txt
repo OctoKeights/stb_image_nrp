@@ -1,0 +1,8 @@
+stb_image_more 200 862f96fa8feea5f9
+stb_image_more 400 d32c153b3d220fc8
+stb_image_more 600 79c6c7e7951dda50
+stb_image_more bytes of files: 861111; read: 524, refused: 74, left as too large: 2; found to be .jpg: 0, .png: 0, .gif: 127, .bmp: 0, .psd: 86, .pnm: 122, .hdr: 108, .tga: 116, nothing: 41
+stb_image_more 200 9d6344c9907af805
+stb_image_more 400 07264fb3ae36739e
+stb_image_more 600 5a15771bab2c6ce1
+stb_image_more bytes of files: 934511; read: 507, refused: 91, left as too large: 2; found to be .jpg: 0, .png: 0, .gif: 118, .bmp: 0, .psd: 92, .pnm: 111, .hdr: 108, .tga: 109, nothing: 62

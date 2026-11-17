@@ -1,0 +1,17 @@
+[package]
+name = "stb_image_nrp"
+description = "Image file readers in pure, safe Rust: a native port of stb_image.h (PNG, BMP, JPEG, GIF, TGA, PSD, PNM, HDR), giving the pixels it gives."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Unlicense"
+repository = "https://github.com/OctoKeights/stb_image_nrp"
+readme = "README.md"
+keywords = ["png", "jpeg", "image", "decoder", "stb"]
+categories = ["multimedia::images", "encoding"]
+
+[dependencies]
+
+[dev-dependencies]
+miniz_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/miniz_nrp" }
+stb_image_write_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/stb_image_write_nrp" }
