@@ -1157,8 +1157,8 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
                 if !build_huffman(s, table, &sizes) {
                     return false;
                 }
-                for i in 0..n as usize {
-                    table.values[i] = s.get8();
+                for value in &mut table.values[..n as usize] {
+                    *value = s.get8();
                 }
                 if tc != 0 {
                     build_fast_ac(&mut z.fast_ac[th], &z.huff_ac[th]);
@@ -1353,23 +1353,19 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
         return s.err("too large");
     }
 
-    for i in 0..s.img_n as usize {
-        if z.img_comp[i].h > h_max {
-            h_max = z.img_comp[i].h;
-        }
-        if z.img_comp[i].v > v_max {
-            v_max = z.img_comp[i].v;
-        }
+    for comp in &z.img_comp[..s.img_n as usize] {
+        h_max = h_max.max(comp.h);
+        v_max = v_max.max(comp.v);
     }
 
     // check that plane subsampling factors are integer ratios;
     // our resamplers can't deal with fractional ratios
     // and I've never seen a non-corrupted JPEG file actually use them
-    for i in 0..s.img_n as usize {
-        if h_max % z.img_comp[i].h != 0 {
+    for comp in &z.img_comp[..s.img_n as usize] {
+        if h_max % comp.h != 0 {
             return s.err("bad H");
         }
-        if v_max % z.img_comp[i].v != 0 {
+        if v_max % comp.v != 0 {
             return s.err("bad V");
         }
     }
