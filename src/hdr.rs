@@ -2,7 +2,8 @@
 //! between floats and 8 bits a channel, `stbi__hdr_to_ldr` and `stbi__ldr_to_hdr`.
 
 use super::{
-    Context, ImageType, Info, LoadOptions, STBI_MAX_DIMENSIONS, mad3sizes_valid, mad4sizes_valid,
+    Context, ImageFormat, LoadOptions, RawInfo, STBI_MAX_DIMENSIONS, mad3sizes_valid,
+    mad4sizes_valid,
 };
 
 /// `stbi__hdr_test_core`
@@ -300,7 +301,7 @@ pub(crate) fn hdr_load(s: &mut Context, mut req_comp: i32) -> Option<(Vec<f32>, 
 }
 
 /// `stbi__hdr_info`
-pub(crate) fn hdr_info(s: &mut Context) -> Option<Info> {
+pub(crate) fn hdr_info(s: &mut Context) -> Option<RawInfo> {
     if !hdr_test(s) {
         s.rewind();
         return None;
@@ -326,8 +327,8 @@ pub(crate) fn hdr_info(s: &mut Context) -> Option<Info> {
         return None;
     };
 
-    Some(Info {
-        kind: ImageType::Hdr,
+    Some(RawInfo {
+        kind: ImageFormat::Hdr,
         x,
         y,
         comp: 3,
@@ -415,10 +416,7 @@ pub(crate) fn ldr_to_hdr(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        ImageType, LoadOptions, info_from_memory, is_hdr_from_memory, load_from_memory,
-        loadf_from_memory,
-    };
+    use super::super::{ImageFormat, LoadOptions, info, is_hdr, load, load_f32};
     use super::strtol;
 
     #[test]
@@ -434,19 +432,32 @@ mod tests {
     fn a_flat_file_is_read() {
         let mut file = b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 1 +X 2\n".to_vec();
         file.extend_from_slice(&[128, 64, 0, 129, 0, 0, 0, 0]);
-        assert!(is_hdr_from_memory(&file));
-        let info = info_from_memory(&file).unwrap();
+        assert!(is_hdr(&file));
+        let info = info(&file).unwrap();
         assert_eq!(
-            (info.kind, info.x, info.y, info.comp, info.is_hdr),
-            (ImageType::Hdr, 2, 1, 3, true)
+            (
+                info.format,
+                info.width as i32,
+                info.height as i32,
+                info.channels as i32,
+                info.is_hdr
+            ),
+            (ImageFormat::Hdr, 2, 1, 3, true)
         );
-        let image = loadf_from_memory(&file, 0, &LoadOptions::default()).unwrap();
-        assert_eq!((image.x, image.y, image.channels_in_file), (2, 1, 3));
+        let image = load_f32(&file, crate::ch(0), &LoadOptions::default()).unwrap();
+        assert_eq!(
+            (
+                image.width as i32,
+                image.height as i32,
+                image.channels_in_file as i32
+            ),
+            (2, 1, 3)
+        );
         assert_eq!(
             image.data,
             [128.5 / 128.0, 64.5 / 128.0, 0.5 / 128.0, 0.0, 0.0, 0.0]
         );
-        let image = load_from_memory(&file, 0, &LoadOptions::default()).unwrap();
+        let image = load(&file, crate::ch(0), &LoadOptions::default()).unwrap();
         assert_eq!(image.data[3..], [0, 0, 0]);
     }
 }

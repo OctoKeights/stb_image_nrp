@@ -1,37 +1,40 @@
-//! Image files to pixels: a native Rust port of Sean Barrett's
+//! Image files to pixels in pure, safe Rust: a native port of Sean Barrett's
 //! [`stb_image.h`](https://github.com/nothings/stb) v2.32, every reader it has, with the zlib
-//! decoder its PNG reader uses. Each gives the pixels
-//! the original gives, and refuses a file the original refuses, with the same reason.
+//! decoder its PNG reader uses. Each gives the pixels the original gives, and refuses a file
+//! the original refuses, with the same reason.
 //!
 //! - PNG: 1, 2, 4, 8 and 16 bits a channel, grey, colour and palette, with and without alpha
 //!   and interlacing.
+//!
 //! - BMP: 1, 4, 8, 16, 24 and 32 bits a pixel, without run-length encoding.
+//!
 //! - JPEG: baseline and progressive, 8 bits a channel.
-//! - GIF: every frame, with its delay ([`load_gif_from_memory`]), or the first.
-//! - TGA: grey, colour and palette, 8 to 32 bits a pixel, with and without run-length encoding.
+//!
+//! - GIF: every frame, with its delay ([`load_gif`]), or the first.
+//!
+//! - TGA: grey, colour and palette, 8 to 32 bits a pixel, with and without run-length
+//!   encoding.
+//!
 //! - PSD: the merged image of an RGB file, 8 or 16 bits a channel, raw or run-length encoded.
+//!
 //! - PNM: `.pgm` and `.ppm`, binary and text, 8 or 16 bits a channel.
-//! - HDR: Radiance `.hdr` files, flat or run-length encoded, as floats
-//!   ([`loadf_from_memory`]).
 //!
-//! [`load_from_memory`] gives 8 bits a channel, [`load_16_from_memory`] 16 and
-//! [`loadf_from_memory`] floats; [`info_from_memory`] reads only as far as the size. The
-//! settings the original keeps in globals are a [`LoadOptions`] handed to each call.
+//! - HDR: Radiance `.hdr` files, flat or run-length encoded, as floats ([`load_f32`]).
 //!
-//! What is ported is the original as it builds with `STBI_NO_SIMD` (it has the one answer for
-//! every file; with SSE2 or NEON the original's JPEG reader gives other pixels for some damaged
-//! files). Reading is from memory only. Where the original uses memory it has not set, which a
-//! damaged file can bring it to, the port reads zero.
+//! [`load`] gives 8 bits a channel, [`load_16`] 16 and [`load_f32`] floats; [`info`] reads only
+//! as far as the size. The settings the original keeps in globals are a [`LoadOptions`]
+//! passed to each call.
+//!
+//! ```
+//! use stb_image_nrp::{Channels, LoadOptions, load};
+//!
+//! // A 1 by 1 grey PGM file.
+//! let image = load(b"P5 1 1 255\n\x80", Some(Channels::Rgb), &LoadOptions::default()).unwrap();
+//! assert_eq!((image.width, image.height, image.data), (1, 1, vec![128, 128, 128]));
+//! ```
 
 #![forbid(unsafe_code)]
-// The code follows the original's line for line, and these are its shapes.
-#![allow(
-    clippy::needless_range_loop,
-    clippy::too_many_arguments,
-    clippy::manual_range_contains
-)]
-// (The arithmetic is written as the original has it.)
-#![allow(clippy::manual_div_ceil, clippy::int_plus_one)]
+#![warn(missing_docs)]
 
 mod bmp;
 mod gif;
@@ -43,20 +46,76 @@ mod psd;
 mod tga;
 pub mod zlib;
 
-pub use gif::LoadedGif;
+pub use gif::{Animation, Frame};
 
-/// Why a file was refused: the original's `stbi_failure_reason()`, its short words. A few of
-/// its failures set no reason, and the original then shows whatever an earlier call left;
-/// here that is the empty string, or the reason an earlier step of the same call left.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LoadError(pub &'static str);
+/// The channels of each pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Channels {
+    /// One channel: grey.
+    Grey = 1,
+    /// Two channels: grey, then alpha.
+    GreyAlpha = 2,
+    /// Three channels: red, green and blue.
+    Rgb = 3,
+    /// Four channels: red, green, blue and alpha.
+    Rgba = 4,
+}
+
+impl Channels {
+    /// The channels for a count of 1 to 4.
+    pub const fn from_count(count: u8) -> Option<Channels> {
+        match count {
+            1 => Some(Channels::Grey),
+            2 => Some(Channels::GreyAlpha),
+            3 => Some(Channels::Rgb),
+            4 => Some(Channels::Rgba),
+            _ => None,
+        }
+    }
+
+    /// The number of channels.
+    pub const fn count(self) -> usize {
+        self as usize
+    }
+
+    /// The channels of a count the readers produce, which is always 1 to 4.
+    fn of(count: i32) -> Channels {
+        Channels::from_count(count as u8).expect("1 to 4 channels")
+    }
+}
+
+/// The count the readers take for the channels asked for: 0 for those of the file.
+fn requested(channels: Option<Channels>) -> i32 {
+    channels.map_or(0, |channels| channels as i32)
+}
+
+/// Why a file was refused: the original's `stbi_failure_reason()`.
+///
+/// A few of the original's failures set no reason, and it then reports whatever an earlier
+/// call left; here the reason is then empty, or the one an earlier step of the same call
+/// left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LoadError {
+    reason: &'static str,
+}
+
+impl LoadError {
+    pub(crate) const fn new(reason: &'static str) -> LoadError {
+        LoadError { reason }
+    }
+
+    /// The original's short description of the failure, such as `"bad zlib header"`.
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
 
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.0.is_empty() {
+        if self.reason.is_empty() {
             f.write_str("the image could not be read")
         } else {
-            f.write_str(self.0)
+            f.write_str(self.reason)
         }
     }
 }
@@ -66,32 +125,32 @@ impl std::error::Error for LoadError {}
 /// The settings the original keeps in globals.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LoadOptions {
-    /// Give the image with its last row first: `stbi_set_flip_vertically_on_load`.
-    pub flip_vertically_on_load: bool,
-    /// For an iPhone PNG whose colours were multiplied by its alpha, divide them back:
-    /// `stbi_set_unpremultiply_on_load`. Only does anything with the setting below.
-    pub unpremultiply_on_load: bool,
-    /// Give an iPhone PNG (one with a `CgBI` chunk), which is stored blue first, red first:
-    /// `stbi_convert_iphone_png_to_rgb`.
+    /// Give the image with its last row first (`stbi_set_flip_vertically_on_load`).
+    pub flip_vertically: bool,
+    /// For an iPhone PNG whose colours were multiplied by its alpha, divide them back
+    /// (`stbi_set_unpremultiply_on_load`). Only takes effect with `convert_iphone_png_to_rgb`.
+    pub unpremultiply: bool,
+    /// Give an iPhone PNG (one with a `CgBI` chunk), which is stored blue first, red first
+    /// (`stbi_convert_iphone_png_to_rgb`).
     pub convert_iphone_png_to_rgb: bool,
-    /// The gamma an HDR file's floats are brought to 8 bits with: `stbi_hdr_to_ldr_gamma`.
-    /// 2.2 unless changed.
+    /// The gamma with which an HDR file's floats are brought to 8 or 16 bits
+    /// (`stbi_hdr_to_ldr_gamma`). 2.2 by default.
     pub hdr_to_ldr_gamma: f32,
-    /// What an HDR file's floats are divided by first: `stbi_hdr_to_ldr_scale`. 1 unless
-    /// changed.
+    /// What an HDR file's floats are multiplied by first (`stbi_hdr_to_ldr_scale`). 1 by
+    /// default.
     pub hdr_to_ldr_scale: f32,
-    /// The gamma an 8-bit file's values are made floats with by [`loadf_from_memory`]:
-    /// `stbi_ldr_to_hdr_gamma`. 2.2 unless changed.
+    /// The gamma with which [`load_f32`] makes another file's values floats
+    /// (`stbi_ldr_to_hdr_gamma`). 2.2 by default.
     pub ldr_to_hdr_gamma: f32,
-    /// What those floats are multiplied by: `stbi_ldr_to_hdr_scale`. 1 unless changed.
+    /// What those floats are multiplied by (`stbi_ldr_to_hdr_scale`). 1 by default.
     pub ldr_to_hdr_scale: f32,
 }
 
 impl Default for LoadOptions {
     fn default() -> LoadOptions {
         LoadOptions {
-            flip_vertically_on_load: false,
-            unpremultiply_on_load: false,
+            flip_vertically: false,
+            unpremultiply: false,
             convert_iphone_png_to_rgb: false,
             hdr_to_ldr_gamma: 2.2,
             hdr_to_ldr_scale: 1.0,
@@ -101,50 +160,94 @@ impl Default for LoadOptions {
     }
 }
 
-/// An image out of a file: `x` by `y` pixels from the top row, each of as many values as were
-/// asked for, or of `channels_in_file` when none were (1 grey, 2 grey and alpha, 3 RGB, 4
-/// RGBA).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Loaded<T> {
-    pub x: i32,
-    pub y: i32,
-    /// How many channels the file itself has, whatever was asked for.
-    pub channels_in_file: i32,
+/// An image read from a file: `height` rows of `width` pixels, from the top, each of
+/// `channels` values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Image<T> {
+    /// The width in pixels.
+    pub width: u32,
+    /// The height in pixels.
+    pub height: u32,
+    /// The channels of each pixel in `data`: those asked for, or the file's.
+    pub channels: Channels,
+    /// The channels the file has, whatever was asked for.
+    pub channels_in_file: Channels,
+    /// The values, row after row.
     pub data: Vec<T>,
 }
 
-/// The kind of a file: `STBI_type_*`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageType {
+/// The format of an image file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageFormat {
+    /// JPEG.
     Jpeg,
+    /// PNG.
     Png,
+    /// GIF.
     Gif,
+    /// BMP.
     Bmp,
+    /// Photoshop's PSD.
     Psd,
+    /// The portable anymaps: PGM and PPM.
     Pnm,
+    /// Radiance's HDR (RGBE).
     Hdr,
+    /// Truevision's TGA.
     Tga,
 }
 
-impl ImageType {
-    /// The original's number for the kind: `STBI_type_jpeg` and the rest, from 1.
-    pub fn number(self) -> i32 {
+impl ImageFormat {
+    /// The original's number for the format: `STBI_type_jpeg` and the rest, from 1.
+    pub fn code(self) -> i32 {
         self as i32 + 1
     }
 }
 
-/// What [`info_from_memory`] finds: `stbi_info_res`. (For a BMP stored top row first, `y` is
-/// below zero, as in the original.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What [`info`] finds of a file without reading its pixels (`stbi_info_res`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Info {
-    pub kind: ImageType,
+    /// The file's format.
+    pub format: ImageFormat,
+    /// The width in pixels.
+    pub width: u32,
+    /// The height in pixels. (The original reports a BMP stored top row first as of a
+    /// negative height; here it is positive, as [`load`] reports it.)
+    pub height: u32,
+    /// The channels the file has.
+    pub channels: Channels,
+    /// Whether the file has 16 bits a channel.
+    pub is_16_bit: bool,
+    /// Whether the file is a Radiance `.hdr` file, whose values are floats.
+    pub is_hdr: bool,
+    /// Whether the file is an iPhone PNG, with a `CgBI` chunk.
+    pub is_iphone_png: bool,
+}
+
+/// What the readers find of a file: the original's `stbi_info_res`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RawInfo {
+    pub kind: ImageFormat,
     pub x: i32,
     pub y: i32,
     pub comp: i32,
     pub is_16_bit: bool,
-    /// Whether the file is a Radiance `.hdr` file, whose values are floats.
     pub is_hdr: bool,
     pub is_iphone_png: bool,
+}
+
+impl From<RawInfo> for Info {
+    fn from(raw: RawInfo) -> Info {
+        Info {
+            format: raw.kind,
+            width: raw.x as u32,
+            height: raw.y.unsigned_abs(),
+            channels: Channels::of(raw.comp),
+            is_16_bit: raw.is_16_bit,
+            is_hdr: raw.is_hdr,
+            is_iphone_png: raw.is_iphone_png,
+        }
+    }
 }
 
 /// `STBI_MAX_DIMENSIONS`
@@ -576,21 +679,38 @@ pub(crate) fn vertical_flip<T>(image: &mut [T], w: usize, h: usize, per_pixel: u
     }
 }
 
-/// The image out of an image file's bytes at 8 bits a channel: `stbi_load_from_memory`.
-/// `desired_channels` is how many values a pixel is to have, 1 to 4, or 0 for as many as the
-/// file has. A file of 16 bits a channel is brought down to 8, and an HDR file's floats with
+/// Reads an image file at 8 bits a channel (`stbi_load_from_memory`).
+///
+/// `channels` is the channels each pixel is to have, or `None` for the file's. A file of 16
+/// bits a channel is brought down to 8, and an HDR file's floats with
 /// [`LoadOptions::hdr_to_ldr_gamma`]. Of a GIF, the first frame.
-pub fn load_from_memory(
-    buffer: &[u8],
-    desired_channels: i32,
+pub fn load(
+    file: &[u8],
+    channels: Option<Channels>,
     options: &LoadOptions,
-) -> Result<Loaded<u8>, LoadError> {
-    let mut s = Context::new(buffer, options);
-    load_and_postprocess_8bit(&mut s, desired_channels).ok_or(LoadError(s.reason))
+) -> Result<Image<u8>, LoadError> {
+    let mut s = Context::new(file, options);
+    load_and_postprocess_8bit(&mut s, requested(channels)).ok_or(LoadError::new(s.reason))
+}
+
+/// An image of the values `data`, of the size in the context and the channels asked for or
+/// else the file's.
+fn image<T>(s: &Context, desired_channels: i32, comp: i32, data: Vec<T>) -> Image<T> {
+    Image {
+        width: s.img_x,
+        height: s.img_y,
+        channels: Channels::of(if desired_channels == 0 {
+            comp
+        } else {
+            desired_channels
+        }),
+        channels_in_file: Channels::of(comp),
+        data,
+    }
 }
 
 /// `stbi__load_and_postprocess_8bit`
-fn load_and_postprocess_8bit(s: &mut Context, desired_channels: i32) -> Option<Loaded<u8>> {
+fn load_and_postprocess_8bit(s: &mut Context, desired_channels: i32) -> Option<Image<u8>> {
     let options = s.options;
     let (result, comp) = load_main(s, desired_channels, 8)?;
     let (x, y) = (s.img_x as i32, s.img_y as i32);
@@ -605,32 +725,30 @@ fn load_and_postprocess_8bit(s: &mut Context, desired_channels: i32) -> Option<L
         Pixels::U16(result) => convert_16_to_8(s, result, x, y, channels)?,
     };
 
-    if options.flip_vertically_on_load {
+    if options.flip_vertically {
         vertical_flip(&mut result, x as usize, y as usize, channels as usize);
     }
 
-    Some(Loaded {
-        x,
-        y,
-        channels_in_file: comp,
-        data: result,
-    })
+    Some(image(s, desired_channels, comp, result))
 }
 
-/// The image out of an image file's bytes at 16 bits a channel: `stbi_load_16_from_memory`.
-/// A file of 8 bits a channel is brought up to 16, each value with itself as its lower half.
-pub fn load_16_from_memory(
-    buffer: &[u8],
-    desired_channels: i32,
+/// Reads an image file at 16 bits a channel (`stbi_load_16_from_memory`).
+///
+/// A file of 8 bits a channel is brought up to 16, each value repeated as its low byte, and
+/// an HDR file's floats as [`load`] brings them to 8 bits.
+pub fn load_16(
+    file: &[u8],
+    channels: Option<Channels>,
     options: &LoadOptions,
-) -> Result<Loaded<u16>, LoadError> {
-    let mut s = Context::new(buffer, options);
+) -> Result<Image<u16>, LoadError> {
+    let desired_channels = requested(channels);
+    let mut s = Context::new(file, options);
     // stbi__load_and_postprocess_16bit
     let Some((result, comp)) = load_main(&mut s, desired_channels, 16) else {
-        return Err(LoadError(s.reason));
+        return Err(LoadError::new(s.reason));
     };
     let (x, y) = (s.img_x as i32, s.img_y as i32);
-    let channels = if desired_channels == 0 {
+    let count = if desired_channels == 0 {
         comp
     } else {
         desired_channels
@@ -638,98 +756,89 @@ pub fn load_16_from_memory(
 
     let mut result = match result {
         Pixels::U16(result) => result,
-        Pixels::U8(result) => match convert_8_to_16(&mut s, result, x, y, channels) {
+        Pixels::U8(result) => match convert_8_to_16(&mut s, result, x, y, count) {
             Some(result) => result,
-            None => return Err(LoadError(s.reason)),
+            None => return Err(LoadError::new(s.reason)),
         },
     };
 
-    if options.flip_vertically_on_load {
-        vertical_flip(&mut result, x as usize, y as usize, channels as usize);
+    if options.flip_vertically {
+        vertical_flip(&mut result, x as usize, y as usize, count as usize);
     }
 
-    Ok(Loaded {
-        x,
-        y,
-        channels_in_file: comp,
-        data: result,
-    })
+    Ok(image(&s, desired_channels, comp, result))
 }
 
-/// The image out of an image file's bytes as floats: `stbi_loadf_from_memory`. An HDR file's
-/// values come as they are; any other file's come by way of 8 bits a channel, made floats
-/// with [`LoadOptions::ldr_to_hdr_gamma`] (alpha in a straight line, from 0 to 1).
-pub fn loadf_from_memory(
-    buffer: &[u8],
-    desired_channels: i32,
+/// Reads an image file as floats (`stbi_loadf_from_memory`).
+///
+/// An HDR file's values come as they are. Any other file's come by way of 8 bits a channel,
+/// made floats with [`LoadOptions::ldr_to_hdr_gamma`] and [`LoadOptions::ldr_to_hdr_scale`]
+/// (alpha linearly, from 0 to 1).
+pub fn load_f32(
+    file: &[u8],
+    channels: Option<Channels>,
     options: &LoadOptions,
-) -> Result<Loaded<f32>, LoadError> {
-    let mut s = Context::new(buffer, options);
+) -> Result<Image<f32>, LoadError> {
+    let desired_channels = requested(channels);
+    let mut s = Context::new(file, options);
     // stbi__loadf_main
     if hdr::hdr_test(&mut s) {
         let Some((mut data, comp)) = hdr::hdr_load(&mut s, desired_channels) else {
-            return Err(LoadError(s.reason));
+            return Err(LoadError::new(s.reason));
         };
         let (x, y) = (s.img_x as i32, s.img_y as i32);
         // stbi__float_postprocess
-        if options.flip_vertically_on_load {
-            let channels = if desired_channels != 0 {
+        if options.flip_vertically {
+            let count = if desired_channels != 0 {
                 desired_channels
             } else {
                 comp
             };
-            vertical_flip(&mut data, x as usize, y as usize, channels as usize);
+            vertical_flip(&mut data, x as usize, y as usize, count as usize);
         }
-        return Ok(Loaded {
-            x,
-            y,
-            channels_in_file: comp,
-            data,
-        });
+        return Ok(image(&s, desired_channels, comp, data));
     }
     if let Some(loaded) = load_and_postprocess_8bit(&mut s, desired_channels) {
-        let channels = if desired_channels != 0 {
-            desired_channels
-        } else {
-            loaded.channels_in_file
-        };
-        return match hdr::ldr_to_hdr(&mut s, loaded.data, loaded.x, loaded.y, channels, options) {
-            Some(data) => Ok(Loaded {
-                x: loaded.x,
-                y: loaded.y,
+        let (x, y) = (loaded.width as i32, loaded.height as i32);
+        let count = loaded.channels as i32;
+        return match hdr::ldr_to_hdr(&mut s, loaded.data, x, y, count, options) {
+            Some(data) => Ok(Image {
+                width: loaded.width,
+                height: loaded.height,
+                channels: loaded.channels,
                 channels_in_file: loaded.channels_in_file,
                 data,
             }),
-            None => Err(LoadError(s.reason)),
+            None => Err(LoadError::new(s.reason)),
         };
     }
-    Err(LoadError("unknown image type"))
+    Err(LoadError::new("unknown image type"))
 }
 
-/// Every frame of a GIF file, one after another, each with its delay:
-/// `stbi_load_gif_from_memory`.
-pub fn load_gif_from_memory(
-    buffer: &[u8],
-    desired_channels: i32,
+/// Reads every frame of a GIF file, each with its delay (`stbi_load_gif_from_memory`).
+pub fn load_gif(
+    file: &[u8],
+    channels: Option<Channels>,
     options: &LoadOptions,
-) -> Result<LoadedGif, LoadError> {
-    let mut s = Context::new(buffer, options);
-    if !(0..=4).contains(&desired_channels) {
-        return Err(LoadError("bad req_comp"));
-    }
-    gif::load_gif_main(&mut s, desired_channels).ok_or(LoadError(s.reason))
+) -> Result<Animation, LoadError> {
+    let mut s = Context::new(file, options);
+    gif::load_gif_main(&mut s, requested(channels)).ok_or(LoadError::new(s.reason))
 }
 
-/// Whether a file's bytes are a Radiance `.hdr` file: `stbi_is_hdr_from_memory`.
-pub fn is_hdr_from_memory(buffer: &[u8]) -> bool {
-    hdr::hdr_test(&mut Context::new(buffer, &LoadOptions::default()))
+/// Whether a file is a Radiance `.hdr` file (`stbi_is_hdr_from_memory`).
+pub fn is_hdr(file: &[u8]) -> bool {
+    hdr::hdr_test(&mut Context::new(file, &LoadOptions::default()))
 }
 
-/// The size and kind of the image in a file's bytes, without its pixels:
-/// `stbi_info2_from_memory`.
-pub fn info_from_memory(buffer: &[u8]) -> Result<Info, LoadError> {
+/// The format, size and channels of the image in a file, without its pixels
+/// (`stbi_info_from_memory`, with `stbi_is_16_bit_from_memory`).
+pub fn info(file: &[u8]) -> Result<Info, LoadError> {
+    raw_info(file).map(Info::from)
+}
+
+/// `stbi__info_main`
+fn raw_info(buffer: &[u8]) -> Result<RawInfo, LoadError> {
     let mut s = Context::new(buffer, &LoadOptions::default());
-    // stbi__info2_main
     if let Some(info) = jpeg::jpeg_info(&mut s) {
         return Ok(info);
     }
@@ -755,12 +864,18 @@ pub fn info_from_memory(buffer: &[u8]) -> Result<Info, LoadError> {
     if let Some(info) = tga::tga_info(&mut s) {
         return Ok(info);
     }
-    Err(LoadError("unknown image type"))
+    Err(LoadError::new("unknown image type"))
 }
 
-/// Whether the image in a file's bytes has 16 bits a channel: `stbi_is_16_bit_from_memory`.
-pub fn is_16_bit_from_memory(buffer: &[u8]) -> bool {
-    info_from_memory(buffer).is_ok_and(|info| info.is_16_bit)
+/// Whether the image in a file has 16 bits a channel (`stbi_is_16_bit_from_memory`).
+pub fn is_16_bit(file: &[u8]) -> bool {
+    raw_info(file).is_ok_and(|info| info.is_16_bit)
+}
+
+/// The channels for a count as the original takes it, 0 for the file's.
+#[cfg(test)]
+pub(crate) fn ch(count: i32) -> Option<Channels> {
+    Channels::from_count(count as u8)
 }
 
 #[cfg(test)]
@@ -848,26 +963,25 @@ mod tests {
     fn what_is_no_image_is_refused() {
         let options = LoadOptions::default();
         assert_eq!(
-            load_from_memory(&[], 0, &options),
-            Err(LoadError("unknown image type"))
+            load(&[], None, &options),
+            Err(LoadError::new("unknown image type"))
         );
         assert_eq!(
-            load_from_memory(b"not an image at all", 0, &options),
-            Err(LoadError("unknown image type"))
+            load(b"not an image at all", None, &options),
+            Err(LoadError::new("unknown image type"))
         );
-        assert_eq!(
-            load_from_memory(&[], 5, &options),
-            Err(LoadError("bad req_comp"))
-        );
-        assert_eq!(
-            info_from_memory(b"GIF8"),
-            Err(LoadError("unknown image type"))
-        );
-        assert!(!is_16_bit_from_memory(&[]));
+        assert_eq!(info(b"GIF8"), Err(LoadError::new("unknown image type")));
+        assert!(!is_16_bit(&[]));
+        assert_eq!(Channels::from_count(5), None);
     }
 }
 
-/// (The README's examples, compiled and run with the tests.)
+/// The README's examples, compiled and run as doctests.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+/// The Guide's examples, compiled and run as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../docs/guide.md")]
+struct GuideDoctests;

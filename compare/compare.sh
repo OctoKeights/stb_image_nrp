@@ -8,9 +8,9 @@
 # wraps (-fwrapv), so that the damaged files among those it reads have one answer; it uses its
 # stb_image_write.h to make some of the files and miniz (https://github.com/richgel999/miniz, in
 # $MINIZ) to compress others. examples/dump.rs is built from the port (with stb_image_write_nrp
-# and miniz_nrp for the same); both run the same made-up files for each seed and what they print
+# and miniz_nrp for the same); both run the same synthetic files for each seed and what they print
 # is compared byte for byte. Dumps: stb_image and stb_image_more, each with a tenth of [count]
-# (200,000 by default) as the number of made-up files, each asked its size and read once or
+# (200,000 by default) as the number of synthetic files, each asked its size and read once or
 # more.
 set -u
 if [ $# -lt 1 ]; then

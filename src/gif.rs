@@ -2,25 +2,30 @@
 //! stb. Every frame of an animation, or the first.
 
 use super::{
-    Context, ImageType, Info, STBI_MAX_DIMENSIONS, addints_valid, convert_format, mad3sizes_valid,
-    vertical_flip,
+    Channels, Context, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, addints_valid, convert_format,
+    mad3sizes_valid, vertical_flip,
 };
 
-/// Every frame of a GIF file: [`super::load_gif_from_memory`].
+/// Every frame of a GIF file, as [`super::load_gif`] reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoadedGif {
-    /// The size of every frame.
-    pub x: i32,
-    pub y: i32,
-    /// How many frames there are.
-    pub frames: i32,
-    /// How many channels the file has: always 4.
-    pub channels_in_file: i32,
-    /// How long each frame is shown, in thousandths of a second.
-    pub delays: Vec<i32>,
-    /// The frames one after another, each `x` by `y` pixels from the top row, of as many values
-    /// as were asked for, or of 4 when none were.
+pub struct Animation {
+    /// The width of the image in pixels, as its header gives it.
+    pub width: u32,
+    /// The height of the image in pixels, as its header gives it.
+    pub height: u32,
+    /// The channels of each pixel of the frames: those asked for, or RGBA.
+    pub channels: Channels,
+    /// The frames, in order.
+    pub frames: Vec<Frame>,
+}
+
+/// One frame of an [`Animation`]: the whole image as it stands after the frame is drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    /// The pixels, row after row from the top.
     pub data: Vec<u8>,
+    /// How long the frame is shown, in milliseconds.
+    pub delay_ms: i32,
 }
 
 /// Which colour table the frame being read uses.
@@ -542,7 +547,7 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
 }
 
 /// `stbi__load_gif_main`
-pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<LoadedGif> {
+pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<Animation> {
     if !gif_test(s) {
         return s.errp("not GIF");
     }
@@ -552,7 +557,6 @@ pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<LoadedGif>
     let mut totalbytes = 0i32;
     let mut frames: Vec<(i32, Vec<u8>)> = Vec::new();
     let mut saved: Option<usize> = None;
-    let (mut x, mut y) = (0, 0);
 
     loop {
         match gif_load_next(s, &mut g, saved.map(|frame| frames[frame].1.as_slice())) {
@@ -564,8 +568,6 @@ pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<LoadedGif>
             Next::Frame => {}
         }
 
-        x = g.w;
-        y = g.h;
         let stride = g.w * g.h * 4;
 
         // we ensure g.w > 0, g.h > 0; that means totalbytes > 0 and this check
@@ -596,7 +598,7 @@ pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<LoadedGif>
         delays.push(delay);
         let at = out.len();
         out.extend_from_slice(&pixels);
-        if s.options.flip_vertically_on_load {
+        if s.options.flip_vertically {
             vertical_flip(&mut out[at..], g.w as usize, g.h as usize, 4);
         }
     }
@@ -606,14 +608,20 @@ pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<LoadedGif>
         out = convert_format(s, out, 4, req_comp, g.w as u32, (layers * g.h) as u32)?;
     }
 
-    let channels_in_file = if g.w != 0 { 4 } else { 0 };
-    Some(LoadedGif {
-        x,
-        y,
-        frames: layers,
-        channels_in_file,
-        delays,
-        data: out,
+    let channels = if req_comp != 0 { req_comp } else { 4 };
+    let frame_len = (g.w * g.h * channels) as usize;
+    Some(Animation {
+        width: g.w as u32,
+        height: g.h as u32,
+        channels: Channels::of(channels),
+        frames: delays
+            .into_iter()
+            .enumerate()
+            .map(|(i, delay_ms)| Frame {
+                data: out[i * frame_len..(i + 1) * frame_len].to_vec(),
+                delay_ms,
+            })
+            .collect(),
     })
 }
 
@@ -636,10 +644,10 @@ pub(crate) fn gif_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
 }
 
 /// `stbi__gif_info`
-pub(crate) fn gif_info(s: &mut Context) -> Option<Info> {
+pub(crate) fn gif_info(s: &mut Context) -> Option<RawInfo> {
     let (x, y) = gif_info_raw(s)?;
-    Some(Info {
-        kind: ImageType::Gif,
+    Some(RawInfo {
+        kind: ImageFormat::Gif,
         x,
         y,
         comp: 4,
@@ -651,7 +659,7 @@ pub(crate) fn gif_info(s: &mut Context) -> Option<Info> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{LoadOptions, load_from_memory, load_gif_from_memory};
+    use super::super::{LoadOptions, load, load_gif};
 
     /// A GIF of `w` by `h` pixels with a two-colour global table, each frame `(delay, pixels)`,
     /// written with no compression to speak of: a clear code before every pixel.
@@ -694,14 +702,26 @@ mod tests {
     #[test]
     fn the_first_frame_or_all_of_them() {
         let file = gif(2, 1, &[(5, &[0, 1]), (7, &[1, 1])]);
-        let image = load_from_memory(&file, 0, &LoadOptions::default()).unwrap();
-        assert_eq!((image.x, image.y, image.channels_in_file), (2, 1, 4));
-        assert_eq!(image.data, [10, 20, 30, 255, 40, 50, 60, 255]);
-        let all = load_gif_from_memory(&file, 3, &LoadOptions::default()).unwrap();
+        let image = load(&file, crate::ch(0), &LoadOptions::default()).unwrap();
         assert_eq!(
-            (all.x, all.y, all.frames, all.delays.clone()),
-            (2, 1, 2, vec![50, 70])
+            (
+                image.width as i32,
+                image.height as i32,
+                image.channels_in_file as i32
+            ),
+            (2, 1, 4)
         );
-        assert_eq!(all.data, [10, 20, 30, 40, 50, 60, 40, 50, 60, 40, 50, 60]);
+        assert_eq!(image.data, [10, 20, 30, 255, 40, 50, 60, 255]);
+        let all = load_gif(&file, crate::ch(3), &LoadOptions::default()).unwrap();
+        assert_eq!((all.width, all.height, all.frames.len()), (2, 1, 2));
+        assert_eq!(
+            all.frames
+                .iter()
+                .map(|frame| frame.delay_ms)
+                .collect::<Vec<_>>(),
+            [50, 70]
+        );
+        assert_eq!(all.frames[0].data, [10, 20, 30, 40, 50, 60]);
+        assert_eq!(all.frames[1].data, [40, 50, 60, 40, 50, 60]);
     }
 }

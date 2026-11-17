@@ -7,7 +7,7 @@
 //!   - avoids explicit window management
 
 use super::{
-    Context, ImageType, Info, Pixels, STBI_MAX_DIMENSIONS, Sample, Scan, convert_format,
+    Context, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, Sample, Scan, convert_format,
     mad2sizes_valid, mad3sizes_valid, zlib,
 };
 
@@ -101,10 +101,8 @@ fn create_png_image_raw(
     a: &mut Png,
     raw: &[u8],
     out_n: i32,
-    x: u32,
-    y: u32,
-    depth: i32,
-    color: i32,
+    (x, y): (u32, u32),
+    (depth, color): (i32, i32),
 ) -> bool {
     let bytes = if depth == 16 { 2 } else { 1 };
     let img_n = s.img_n; // copy it into a local for later
@@ -245,31 +243,31 @@ fn create_png_image_raw(
 
             // expand bits to bytes first
             if depth == 4 {
-                for i in 0..nsmp {
+                for (i, dest) in dest[..nsmp].iter_mut().enumerate() {
                     if i & 1 == 0 {
                         inb = cur[input];
                         input += 1;
                     }
-                    dest[i] = scale.wrapping_mul(inb >> 4);
+                    *dest = scale.wrapping_mul(inb >> 4);
                     inb <<= 4;
                 }
             } else if depth == 2 {
-                for i in 0..nsmp {
+                for (i, dest) in dest[..nsmp].iter_mut().enumerate() {
                     if i & 3 == 0 {
                         inb = cur[input];
                         input += 1;
                     }
-                    dest[i] = scale.wrapping_mul(inb >> 6);
+                    *dest = scale.wrapping_mul(inb >> 6);
                     inb <<= 2;
                 }
             } else {
                 debug_assert!(depth == 1);
-                for i in 0..nsmp {
+                for (i, dest) in dest[..nsmp].iter_mut().enumerate() {
                     if i & 7 == 0 {
                         inb = cur[input];
                         input += 1;
                     }
-                    dest[i] = scale.wrapping_mul(inb >> 7);
+                    *dest = scale.wrapping_mul(inb >> 7);
                     inb <<= 1;
                 }
             }
@@ -295,8 +293,8 @@ fn create_png_image_raw(
             } else {
                 debug_assert!(img_n + 1 == out_n);
                 for (i, dest) in dest16.chunks_exact_mut(out_n_).enumerate() {
-                    for c in 0..img_n_ {
-                        dest[c] = value(i * img_n_ + c);
+                    for (c, dest) in dest[..img_n_].iter_mut().enumerate() {
+                        *dest = value(i * img_n_ + c);
                     }
                     dest[img_n_] = 0xffff;
                 }
@@ -315,19 +313,27 @@ fn create_png_image_raw(
     true
 }
 
-/// The copying of one pass of an interlaced image to its places in the whole.
-fn spread<T: Copy>(
-    whole: &mut [T],
-    pass: &[T],
-    img_x: usize,
-    out_n: usize,
+/// Where a pass of an interlaced image goes in the whole: its size, its first pixel's place,
+/// and the spacing of its pixels.
+struct Placement {
     x: usize,
     y: usize,
     xorig: usize,
     yorig: usize,
     xspc: usize,
     yspc: usize,
-) {
+}
+
+/// The copying of one pass of an interlaced image to its places in the whole.
+fn spread<T: Copy>(whole: &mut [T], pass: &[T], img_x: usize, out_n: usize, place: &Placement) {
+    let Placement {
+        x,
+        y,
+        xorig,
+        yorig,
+        xspc,
+        yspc,
+    } = *place;
     for j in 0..y {
         for i in 0..x {
             let out_y = j * yspc + yorig;
@@ -351,7 +357,7 @@ fn create_png_image(
     let bytes = if depth == 16 { 2 } else { 1 };
     let out_bytes = out_n * bytes;
     if !interlaced {
-        return create_png_image_raw(s, a, image_data, out_n, s.img_x, s.img_y, depth, color);
+        return create_png_image_raw(s, a, image_data, out_n, (s.img_x, s.img_y), (depth, color));
     }
 
     // de-interlacing
@@ -375,23 +381,22 @@ fn create_png_image(
         let y = (s.img_y.wrapping_sub(yorig[p]).wrapping_add(yspc[p] - 1)) / yspc[p];
         if x != 0 && y != 0 {
             let img_len = ((((s.img_n as u32 * x * depth as u32) + 7) >> 3) + 1) * y;
-            if !create_png_image_raw(s, a, image_data, out_n, x, y, depth, color) {
+            if !create_png_image_raw(s, a, image_data, out_n, (x, y), (depth, color)) {
                 return false;
             }
-            let (x, y) = (x as usize, y as usize);
-            let place = (
-                xorig[p] as usize,
-                yorig[p] as usize,
-                xspc[p] as usize,
-                yspc[p] as usize,
-            );
+            let place = Placement {
+                x: x as usize,
+                y: y as usize,
+                xorig: xorig[p] as usize,
+                yorig: yorig[p] as usize,
+                xspc: xspc[p] as usize,
+                yspc: yspc[p] as usize,
+            };
             match (&mut whole, &a.out) {
-                (Pixels::U8(whole), Pixels::U8(pass)) => spread(
-                    whole, pass, img_x, out_n_, x, y, place.0, place.1, place.2, place.3,
-                ),
-                (Pixels::U16(whole), Pixels::U16(pass)) => spread(
-                    whole, pass, img_x, out_n_, x, y, place.0, place.1, place.2, place.3,
-                ),
+                (Pixels::U8(whole), Pixels::U8(pass)) => spread(whole, pass, img_x, out_n_, &place),
+                (Pixels::U16(whole), Pixels::U16(pass)) => {
+                    spread(whole, pass, img_x, out_n_, &place)
+                }
                 _ => unreachable!(),
             }
             image_data = &image_data[img_len as usize..];
@@ -474,7 +479,7 @@ fn de_iphone_bytes(s: &Context, p: &mut [u8], pixel_count: usize) {
         }
     } else {
         debug_assert!(s.img_out_n == 4);
-        if s.options.unpremultiply_on_load {
+        if s.options.unpremultiply {
             // convert bgr to rgb and unpremultiply
             for p in p[..pixel_count * 4].as_chunks_mut::<4>().0.iter_mut() {
                 let a = u32::from(p[3]);
@@ -665,12 +670,12 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
                         return true;
                     }
                     if z.depth == 16 {
-                        for k in 0..(s.img_n as usize).min(3) {
-                            tc16[k] = s.get16be() as u16; // copy the values as-is
+                        for tc16 in tc16.iter_mut().take(s.img_n as usize) {
+                            *tc16 = s.get16be() as u16; // copy the values as-is
                         }
                     } else {
-                        for k in 0..(s.img_n as usize).min(3) {
-                            tc[k] = ((s.get16be() & 255) as u8)
+                        for tc in tc.iter_mut().take(s.img_n as usize) {
+                            *tc = ((s.get16be() & 255) as u8)
                                 .wrapping_mul(STBI_DEPTH_SCALE_TABLE[z.depth as usize]);
                             // non 8-bit images will be larger
                         }
@@ -727,7 +732,7 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
                     return s.err("no IDAT");
                 }
                 // initial guess for decoded data size to avoid unnecessary reallocs
-                let bpl = (s.img_x * z.depth as u32 + 7) / 8; // bytes per line, per component
+                let bpl = (s.img_x * z.depth as u32).div_ceil(8); // bytes per line, per component
                 let raw_len = bpl.wrapping_mul(s.img_y).wrapping_mul(s.img_n as u32) /* pixels */ .wrapping_add(s.img_y) /* filter mode per row */;
                 let expanded = match zlib::decode_for_png(&z.idata, raw_len, !z.is_iphone) {
                     Ok(expanded) => expanded,
@@ -839,7 +844,7 @@ pub(crate) fn png_test(s: &mut Context) -> bool {
 }
 
 /// `stbi__png_info`
-pub(crate) fn png_info(s: &mut Context) -> Option<Info> {
+pub(crate) fn png_info(s: &mut Context) -> Option<RawInfo> {
     let mut p = Png {
         idata: Vec::new(),
         has_idata: false,
@@ -851,8 +856,8 @@ pub(crate) fn png_info(s: &mut Context) -> Option<Info> {
         s.rewind();
         return None;
     }
-    Some(Info {
-        kind: ImageType::Png,
+    Some(RawInfo {
+        kind: ImageFormat::Png,
         x: s.img_x as i32,
         y: s.img_y as i32,
         comp: s.img_n,
@@ -864,10 +869,7 @@ pub(crate) fn png_info(s: &mut Context) -> Option<Info> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        LoadError, LoadOptions, info_from_memory, is_16_bit_from_memory, load_16_from_memory,
-        load_from_memory,
-    };
+    use super::super::{LoadError, LoadOptions, info, is_16_bit, load, load_16};
     use super::*;
     use miniz_nrp::{self as miniz, Level, crc32};
     use stb_image_write_nrp::{Channels, Image, PngFilter, WriteOptions, write_png};
@@ -939,23 +941,33 @@ mod tests {
                         ..WriteOptions::default()
                     },
                 );
-                let loaded = load_from_memory(&file, 0, &options).unwrap();
+                let loaded = load(&file, crate::ch(0), &options).unwrap();
                 assert_eq!(
-                    (loaded.x, loaded.y, loaded.channels_in_file),
+                    (
+                        loaded.width as i32,
+                        loaded.height as i32,
+                        loaded.channels_in_file as i32
+                    ),
                     (19, 11, comp as i32)
                 );
                 assert_eq!(loaded.data, pixels, "{comp} channels, filter {filter:?}");
-                let info = info_from_memory(&file).unwrap();
+                let info = info(&file).unwrap();
                 assert_eq!(
-                    (info.kind, info.x, info.y, info.comp, info.is_16_bit),
-                    (ImageType::Png, 19, 11, comp as i32, false)
+                    (
+                        info.format,
+                        info.width as i32,
+                        info.height as i32,
+                        info.channels as i32,
+                        info.is_16_bit
+                    ),
+                    (ImageFormat::Png, 19, 11, comp as i32, false)
                 );
             }
             // Other numbers of channels than the file has.
             let file = write_png(&image, &WriteOptions::default());
             for wanted in 1..=4 {
-                let loaded = load_from_memory(&file, wanted, &options).unwrap();
-                assert_eq!(loaded.channels_in_file, comp as i32);
+                let loaded = load(&file, crate::ch(wanted), &options).unwrap();
+                assert_eq!(loaded.channels_in_file as i32, comp as i32);
                 let mut s = Context::new(&[], &options);
                 assert_eq!(
                     loaded.data,
@@ -963,18 +975,18 @@ mod tests {
                 );
             }
             // Upside down, and as 16 bits.
-            let flipped = load_from_memory(
+            let flipped = load(
                 &file,
-                0,
+                crate::ch(0),
                 &LoadOptions {
-                    flip_vertically_on_load: true,
+                    flip_vertically: true,
                     ..options
                 },
             )
             .unwrap();
             let rows: Vec<u8> = pixels.chunks(19 * comp).rev().flatten().copied().collect();
             assert_eq!(flipped.data, rows);
-            let wide = load_16_from_memory(&file, 0, &options).unwrap();
+            let wide = load_16(&file, crate::ch(0), &options).unwrap();
             assert!(
                 wide.data
                     .iter()
@@ -997,18 +1009,18 @@ mod tests {
             &[],
             &[0, 0x12, 0x34, 0xff, 0xff, 0xab, 0xcd, 0x00, 0x01],
         );
-        assert!(is_16_bit_from_memory(&file));
-        let wide = load_16_from_memory(&file, 0, &options).unwrap();
+        assert!(is_16_bit(&file));
+        let wide = load_16(&file, crate::ch(0), &options).unwrap();
         assert_eq!(
-            (wide.channels_in_file, &wide.data[..]),
+            (wide.channels_in_file as i32, &wide.data[..]),
             (2, &[0x1234u16, 0xffff, 0xabcd, 0x0001][..])
         );
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [0x12, 0xff, 0xab, 0x00]
         );
         assert_eq!(
-            load_16_from_memory(&file, 4, &options).unwrap().data,
+            load_16(&file, crate::ch(4), &options).unwrap().data,
             [
                 0x1234, 0x1234, 0x1234, 0xffff, 0xabcd, 0xabcd, 0xabcd, 0x0001
             ]
@@ -1023,35 +1035,35 @@ mod tests {
             &[(b"tRNS", &[0, 1, 0, 2, 0, 3])],
             &[0, 0, 1, 0, 2, 0, 3, 0, 1, 0, 2, 0, 4],
         );
-        let wide = load_16_from_memory(&file, 0, &options).unwrap();
+        let wide = load_16(&file, crate::ch(0), &options).unwrap();
         assert_eq!(
-            (wide.channels_in_file, &wide.data[..]),
+            (wide.channels_in_file as i32, &wide.data[..]),
             (4, &[1u16, 2, 3, 0, 1, 2, 4, 0xffff][..])
         );
         // 1, 2 and 4 bits of grey, scaled to the whole range.
         let file = png(10, 1, 1, 0, 0, &[], &[0, 0b1010_0011, 0b0100_0000]);
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [255, 0, 255, 0, 0, 0, 255, 255, 0, 255]
         );
         let file = png(3, 1, 2, 0, 0, &[], &[0, 0b0001_1011]);
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [0, 85, 170]
         );
         let file = png(3, 2, 4, 0, 0, &[], &[0, 0x01, 0xf0, 2, 0x10, 0x00]);
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [0, 17, 255, 17, 17, 255]
         );
         // 2 bits of grey with a transparent value, asked for with and without alpha.
         let file = png(3, 1, 2, 0, 0, &[(b"tRNS", &[0, 1])], &[0, 0b0001_1011]);
-        let loaded = load_from_memory(&file, 0, &options).unwrap();
+        let loaded = load(&file, crate::ch(0), &options).unwrap();
         assert_eq!(
-            (loaded.channels_in_file, &loaded.data[..]),
+            (loaded.channels_in_file as i32, &loaded.data[..]),
             (2, &[0u8, 255, 85, 0, 170, 255][..])
         );
-        assert_eq!(info_from_memory(&file).unwrap().comp, 2);
+        assert_eq!(info(&file).unwrap().channels as i32, 2);
     }
 
     #[test]
@@ -1060,13 +1072,13 @@ mod tests {
         let colours = [10, 20, 30, 40, 50, 60, 70, 80, 90];
         // 8 bits of index; the last pixel's index has no colour, and is black.
         let file = png(4, 1, 8, 3, 0, &[(b"PLTE", &colours)], &[0, 2, 0, 1, 7]);
-        let loaded = load_from_memory(&file, 0, &options).unwrap();
+        let loaded = load(&file, crate::ch(0), &options).unwrap();
         assert_eq!(
-            (loaded.channels_in_file, &loaded.data[..]),
+            (loaded.channels_in_file as i32, &loaded.data[..]),
             (3, &[70u8, 80, 90, 10, 20, 30, 40, 50, 60, 0, 0, 0][..])
         );
         assert_eq!(
-            load_from_memory(&file, 4, &options).unwrap().data,
+            load(&file, crate::ch(4), &options).unwrap().data,
             [
                 70, 80, 90, 255, 10, 20, 30, 255, 40, 50, 60, 255, 0, 0, 0, 0
             ]
@@ -1081,20 +1093,20 @@ mod tests {
             &[(b"PLTE", &colours), (b"tRNS", &[0, 128])],
             &[0, 0b0001_1000],
         );
-        let loaded = load_from_memory(&file, 0, &options).unwrap();
+        let loaded = load(&file, crate::ch(0), &options).unwrap();
         assert_eq!(
-            (loaded.channels_in_file, &loaded.data[..]),
+            (loaded.channels_in_file as i32, &loaded.data[..]),
             (4, &[10u8, 20, 30, 0, 40, 50, 60, 128, 70, 80, 90, 255][..])
         );
-        assert_eq!(info_from_memory(&file).unwrap().comp, 4);
-        assert_eq!(load_from_memory(&file, 1, &options).unwrap().data.len(), 3);
+        assert_eq!(info(&file).unwrap().channels as i32, 4);
+        assert_eq!(load(&file, crate::ch(1), &options).unwrap().data.len(), 3);
         // No palette, alphas before it, alphas for more colours than there are.
         assert_eq!(
-            load_from_memory(&png(1, 1, 8, 3, 0, &[], &[0, 0]), 0, &options),
-            Err(LoadError("no PLTE"))
+            load(&png(1, 1, 8, 3, 0, &[], &[0, 0]), crate::ch(0), &options),
+            Err(LoadError::new("no PLTE"))
         );
         assert_eq!(
-            load_from_memory(
+            load(
                 &png(
                     1,
                     1,
@@ -1104,13 +1116,13 @@ mod tests {
                     &[(b"tRNS", &[1]), (b"PLTE", &colours)],
                     &[0, 0]
                 ),
-                0,
+                crate::ch(0),
                 &options
             ),
-            Err(LoadError("tRNS before PLTE"))
+            Err(LoadError::new("tRNS before PLTE"))
         );
         assert_eq!(
-            load_from_memory(
+            load(
                 &png(
                     1,
                     1,
@@ -1120,10 +1132,10 @@ mod tests {
                     &[(b"PLTE", &colours), (b"tRNS", &[1, 2, 3, 4])],
                     &[0, 0]
                 ),
-                0,
+                crate::ch(0),
                 &options
             ),
-            Err(LoadError("bad tRNS len"))
+            Err(LoadError::new("bad tRNS len"))
         );
     }
 
@@ -1164,12 +1176,12 @@ mod tests {
         }
         let file = png(5, 5, 8, 0, 1, &[], &rows);
         let expected: Vec<u8> = (0..25).map(|i| (i / 5 * 16 + i % 5) as u8).collect();
-        assert_eq!(load_from_memory(&file, 0, &options).unwrap().data, expected);
+        assert_eq!(load(&file, crate::ch(0), &options).unwrap().data, expected);
         // With too few rows.
         let file = png(5, 5, 8, 0, 1, &[], &rows[..rows.len() - 1]);
         assert_eq!(
-            load_from_memory(&file, 0, &options),
-            Err(LoadError("not enough pixels"))
+            load(&file, crate::ch(0), &options),
+            Err(LoadError::new("not enough pixels"))
         );
     }
 
@@ -1187,9 +1199,9 @@ mod tests {
         );
         chunk(&mut file, b"IEND", &[]);
         let options = LoadOptions::default();
-        assert!(info_from_memory(&file).unwrap().is_iphone_png);
+        assert!(info(&file).unwrap().is_iphone_png);
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [30, 20, 10, 128]
         );
         let red_first = LoadOptions {
@@ -1197,15 +1209,15 @@ mod tests {
             ..options
         };
         assert_eq!(
-            load_from_memory(&file, 0, &red_first).unwrap().data,
+            load(&file, crate::ch(0), &red_first).unwrap().data,
             [10, 20, 30, 128]
         );
         let divided = LoadOptions {
-            unpremultiply_on_load: true,
+            unpremultiply: true,
             ..red_first
         };
         assert_eq!(
-            load_from_memory(&file, 0, &divided).unwrap().data,
+            load(&file, crate::ch(0), &divided).unwrap().data,
             [20, 40, 60, 128]
         );
     }
@@ -1222,8 +1234,8 @@ mod tests {
             &[],
             &[0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6],
         );
-        assert!(load_from_memory(&good, 0, &options).is_ok());
-        let refused = |file: &[u8]| load_from_memory(file, 0, &options).unwrap_err().0;
+        assert!(load(&good, crate::ch(0), &options).is_ok());
+        let refused = |file: &[u8]| load(file, crate::ch(0), &options).unwrap_err().reason();
         assert_eq!(refused(&good[..8]), "first not IHDR");
         assert_eq!(refused(&good[..45]), "outofdata");
         assert_eq!(
@@ -1285,8 +1297,8 @@ mod tests {
             &[0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6],
         );
         assert_eq!(
-            load_from_memory(&with_text, 0, &options),
-            load_from_memory(&good, 0, &options)
+            load(&with_text, crate::ch(0), &options),
+            load(&good, crate::ch(0), &options)
         );
         // No pixels at all, and pixels that are no zlib stream.
         let mut file = good[..33].to_vec();

@@ -201,13 +201,18 @@ impl Zbuf<'_> {
                     return false;
                 }
                 let from = self.zout.len() - dist as usize;
+                let len = len as usize;
                 if dist == 1 {
                     // run of one byte; common in images.
                     let v = self.zout[from];
-                    self.zout.resize(self.zout.len() + len as usize, v);
+                    self.zout.resize(self.zout.len() + len, v);
+                } else if dist as usize >= len {
+                    // (A copy that does not overlap what it writes: all at once.)
+                    self.zout.extend_from_within(from..from + len);
                 } else {
-                    for i in 0..len as usize {
-                        let v = self.zout[from + i];
+                    self.zout.reserve(len);
+                    for i in from..from + len {
+                        let v = self.zout[i];
                         self.zout.push(v);
                     }
                 }
@@ -408,11 +413,15 @@ fn zbuild_huffman(z: &mut ZHuffman, sizelist: &[u8], reason: &mut Option<&'stati
         sizes[usize::from(size)] += 1;
     }
     sizes[0] = 0;
-    for i in 1..16 {
-        if sizes[i] > (1 << i) {
-            *reason = Some("bad sizes");
-            return false;
-        }
+    if sizes
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(15)
+        .any(|(i, &n)| n > 1 << i)
+    {
+        *reason = Some("bad sizes");
+        return false;
     }
     let mut code = 0i32;
     for i in 1..16 {
@@ -420,7 +429,7 @@ fn zbuild_huffman(z: &mut ZHuffman, sizelist: &[u8], reason: &mut Option<&'stati
         z.firstcode[i] = code as u16;
         z.firstsymbol[i] = k as u16;
         code += sizes[i];
-        if sizes[i] != 0 && code - 1 >= (1 << i) {
+        if sizes[i] != 0 && code > 1 << i {
             *reason = Some("bad codelengths");
             return false;
         }
@@ -612,48 +621,47 @@ pub(crate) fn decode_for_png(
 }
 
 fn reason(result: Result<Vec<u8>, Option<&'static str>>) -> Result<Vec<u8>, LoadError> {
-    result.map_err(|reason| LoadError(reason.unwrap_or("")))
+    result.map_err(|reason| LoadError::new(reason.unwrap_or("")))
 }
 
-/// A zlib stream decoded: `stbi_zlib_decode_malloc`.
-pub fn zlib_decode_malloc(buffer: &[u8]) -> Result<Vec<u8>, LoadError> {
-    reason(do_zlib(buffer, 16384, true, true))
+/// The container of a compressed stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Format {
+    /// A zlib stream: a two-byte header, the DEFLATE data, and an Adler-32 checksum, which
+    /// is not checked (as the original does not check it).
+    #[default]
+    Zlib,
+    /// Raw DEFLATE data.
+    Raw,
 }
 
-/// A zlib stream decoded, or with `parse_header` false a deflate stream with no zlib header:
-/// `stbi_zlib_decode_malloc_guesssize_headerflag`. (The size the original starts from does
-/// not change what comes out, so it is not asked for.)
-pub fn zlib_decode_malloc_headerflag(
-    buffer: &[u8],
-    parse_header: bool,
+/// Decompresses a zlib or raw DEFLATE stream (`stbi_zlib_decode_malloc` and
+/// `stbi_zlib_decode_noheader_malloc`).
+///
+/// ```
+/// use stb_image_nrp::zlib::{Format, decompress};
+///
+/// // "hi", stored.
+/// let stream = [0x78, 0x01, 0x01, 0x02, 0x00, 0xFD, 0xFF, b'h', b'i', 0, 0, 0, 0];
+/// assert_eq!(decompress(&stream, Format::Zlib).unwrap(), b"hi");
+/// ```
+pub fn decompress(stream: &[u8], format: Format) -> Result<Vec<u8>, LoadError> {
+    reason(do_zlib(stream, 16384, true, format == Format::Zlib))
+}
+
+/// Decompresses a zlib or raw DEFLATE stream that holds no more than `max_len` bytes
+/// (`stbi_zlib_decode_buffer` and `stbi_zlib_decode_noheader_buffer`). A stream that holds
+/// more fails with the reason `"output buffer limit"`.
+pub fn decompress_with_limit(
+    stream: &[u8],
+    format: Format,
+    max_len: usize,
 ) -> Result<Vec<u8>, LoadError> {
-    reason(do_zlib(buffer, 16384, true, parse_header))
-}
-
-/// A zlib stream decoded into no more than `olen` bytes: `stbi_zlib_decode_buffer`. A stream
-/// that holds more is refused.
-pub fn zlib_decode_buffer(olen: usize, buffer: &[u8]) -> Result<Vec<u8>, LoadError> {
     reason(do_zlib(
-        buffer,
-        olen.min(i32::MAX as usize) as u32,
+        stream,
+        max_len.min(i32::MAX as usize) as u32,
         false,
-        true,
-    ))
-}
-
-/// A deflate stream with no zlib header decoded: `stbi_zlib_decode_noheader_malloc`.
-pub fn zlib_decode_noheader_malloc(buffer: &[u8]) -> Result<Vec<u8>, LoadError> {
-    reason(do_zlib(buffer, 16384, true, false))
-}
-
-/// A deflate stream with no zlib header decoded into no more than `olen` bytes:
-/// `stbi_zlib_decode_noheader_buffer`.
-pub fn zlib_decode_noheader_buffer(olen: usize, buffer: &[u8]) -> Result<Vec<u8>, LoadError> {
-    reason(do_zlib(
-        buffer,
-        olen.min(i32::MAX as usize) as u32,
-        false,
-        false,
+        format == Format::Zlib,
     ))
 }
 
@@ -669,67 +677,70 @@ mod tests {
             .collect();
         for level in [0, 1, 6, 9] {
             let packed = miniz::compress(&text, miniz::Level::new(level).unwrap());
-            assert_eq!(zlib_decode_malloc(&packed).as_deref(), Ok(&text[..]));
+            assert_eq!(decompress(&packed, Format::Zlib).as_deref(), Ok(&text[..]));
             assert_eq!(
-                zlib_decode_buffer(text.len(), &packed).as_deref(),
+                decompress_with_limit(&packed, Format::Zlib, text.len()).as_deref(),
                 Ok(&text[..])
             );
             assert_eq!(
-                zlib_decode_noheader_malloc(&packed[2..]).as_deref(),
+                decompress(&packed[2..], Format::Raw).as_deref(),
                 Ok(&text[..])
             );
             assert_eq!(
-                zlib_decode_noheader_buffer(text.len(), &packed[2..]).as_deref(),
+                decompress_with_limit(&packed[2..], Format::Raw, text.len()).as_deref(),
                 Ok(&text[..])
             );
             assert_eq!(
-                zlib_decode_malloc_headerflag(&packed[2..], false).as_deref(),
+                decompress(&packed[2..], if false { Format::Zlib } else { Format::Raw }).as_deref(),
                 Ok(&text[..])
             );
             // Into too little room.
             assert_eq!(
-                zlib_decode_buffer(text.len() - 1, &packed),
-                Err(LoadError("output buffer limit"))
+                decompress_with_limit(&packed, Format::Zlib, text.len() - 1),
+                Err(LoadError::new("output buffer limit"))
             );
         }
         // The fixed codes.
         let fixed = stb_image_write_nrp::zlib_compress(&text, 8);
-        assert_eq!(zlib_decode_malloc(&fixed).as_deref(), Ok(&text[..]));
+        assert_eq!(decompress(&fixed, Format::Zlib).as_deref(), Ok(&text[..]));
     }
 
     #[test]
     fn what_is_no_stream_is_refused() {
-        assert_eq!(zlib_decode_malloc(&[]), Err(LoadError("bad zlib header")));
         assert_eq!(
-            zlib_decode_malloc(&[0x78, 0x9d, 0]),
-            Err(LoadError("bad zlib header"))
+            decompress(&[], Format::Zlib),
+            Err(LoadError::new("bad zlib header"))
         );
         assert_eq!(
-            zlib_decode_malloc(&[0x78, 0xbb, 0]),
-            Err(LoadError("no preset dict"))
+            decompress(&[0x78, 0x9d, 0], Format::Zlib),
+            Err(LoadError::new("bad zlib header"))
         );
         assert_eq!(
-            zlib_decode_malloc(&[0x79, 0x18, 0]),
-            Err(LoadError("bad compression"))
+            decompress(&[0x78, 0xbb, 0], Format::Zlib),
+            Err(LoadError::new("no preset dict"))
+        );
+        assert_eq!(
+            decompress(&[0x79, 0x18, 0], Format::Zlib),
+            Err(LoadError::new("bad compression"))
         );
         // A block of the kind there is none of: refused with no reason.
-        assert_eq!(zlib_decode_noheader_malloc(&[0x07]), Err(LoadError("")));
+        assert_eq!(decompress(&[0x07], Format::Raw), Err(LoadError::new("")));
         // A stored block whose two lengths disagree, and one longer than the stream.
         assert_eq!(
-            zlib_decode_noheader_malloc(&[0x01, 5, 0, 5, 0]),
-            Err(LoadError("zlib corrupt"))
+            decompress(&[0x01, 5, 0, 5, 0], Format::Raw),
+            Err(LoadError::new("zlib corrupt"))
         );
         assert_eq!(
-            zlib_decode_noheader_malloc(&[0x01, 5, 0, 0xfa, 0xff, 1, 2]),
-            Err(LoadError("read past buffer"))
+            decompress(&[0x01, 5, 0, 0xfa, 0xff, 1, 2], Format::Raw),
+            Err(LoadError::new("read past buffer"))
         );
         // A copy from before the beginning (fixed codes: a length, then distance 1).
         assert_eq!(
-            zlib_decode_noheader_malloc(&[0x03, 0x02, 0x00]),
-            Err(LoadError("bad dist"))
+            decompress(&[0x03, 0x02, 0x00], Format::Raw),
+            Err(LoadError::new("bad dist"))
         );
         // Cut short.
         let packed = miniz::compress(&[7u8; 5000], miniz::Level::new(6).unwrap());
-        assert!(zlib_decode_malloc(&packed[..packed.len() - 6]).is_err());
+        assert!(decompress(&packed[..packed.len() - 6], Format::Zlib).is_err());
     }
 }

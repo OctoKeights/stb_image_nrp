@@ -1,7 +1,8 @@
 //! The TGA reader: `stbi__tga_*`, Targa Truevision, by Jonathan Dummer.
 
 use super::{
-    Context, ImageType, Info, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid, vertical_flip,
+    Context, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid,
+    vertical_flip,
 };
 
 /// `stbi__tga_get_comp`: returns STBI_rgb or whatever, 0 on error; with it, whether the pixels
@@ -82,13 +83,13 @@ fn tga_info_impl(s: &mut Context) -> Option<(i32, i32, i32)> {
 }
 
 /// `stbi__tga_info`
-pub(crate) fn tga_info(s: &mut Context) -> Option<Info> {
+pub(crate) fn tga_info(s: &mut Context) -> Option<RawInfo> {
     let Some((x, y, comp)) = tga_info_impl(s) else {
         s.rewind();
         return None;
     };
-    Some(Info {
-        kind: ImageType::Tga,
+    Some(RawInfo {
+        kind: ImageFormat::Tga,
         x,
         y,
         comp,
@@ -304,7 +305,7 @@ pub(crate) fn tga_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
 
 #[cfg(test)]
 mod tests {
-    use super::super::{LoadOptions, load_from_memory};
+    use super::super::{LoadOptions, load};
 
     /// A TGA file of uncompressed true colour: the header, then the pixels.
     fn tga(image_type: u8, w: u16, h: u16, bits: u8, desc: u8, pixels: &[u8]) -> Vec<u8> {
@@ -320,8 +321,15 @@ mod tests {
     fn rows_come_bottom_first_and_blue_first() {
         // Two by two, BGR, stored bottom row first (the descriptor's bit 5 clear).
         let file = tga(2, 2, 2, 24, 0, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        let image = load_from_memory(&file, 0, &LoadOptions::default()).unwrap();
-        assert_eq!((image.x, image.y, image.channels_in_file), (2, 2, 3));
+        let image = load(&file, crate::ch(0), &LoadOptions::default()).unwrap();
+        assert_eq!(
+            (
+                image.width as i32,
+                image.height as i32,
+                image.channels_in_file as i32
+            ),
+            (2, 2, 3)
+        );
         assert_eq!(image.data, [9, 8, 7, 12, 11, 10, 3, 2, 1, 6, 5, 4]);
     }
 
@@ -329,7 +337,7 @@ mod tests {
     fn run_length_encoding_repeats_a_pixel() {
         // Grey, run-length encoded: a run of three, then one raw pixel.
         let file = tga(11, 4, 1, 8, 0x20, &[0x82, 50, 0x00, 60]);
-        let image = load_from_memory(&file, 0, &LoadOptions::default()).unwrap();
+        let image = load(&file, crate::ch(0), &LoadOptions::default()).unwrap();
         assert_eq!(image.data, [50, 50, 50, 60]);
     }
 }

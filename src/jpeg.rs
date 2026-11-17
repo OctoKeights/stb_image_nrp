@@ -2,8 +2,8 @@
 //! original's plain C kernels (its `STBI_NO_SIMD` build).
 
 use super::{
-    Context, ImageType, Info, STBI_MAX_DIMENSIONS, Scan, addints_valid, compute_y, mad2sizes_valid,
-    mad3sizes_valid, mul2shorts_valid,
+    Context, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, Scan, addints_valid, compute_y,
+    mad2sizes_valid, mad3sizes_valid, mul2shorts_valid,
 };
 
 // huffman decoding acceleration
@@ -152,8 +152,8 @@ impl Jpeg {
 fn build_huffman(s: &mut Context, h: &mut Huffman, count: &[i32; 16]) -> bool {
     let mut k = 0usize;
     // build size list for each symbol (from JPEG spec)
-    for i in 0..16 {
-        for _ in 0..count[i] {
+    for (i, &n) in count.iter().enumerate() {
+        for _ in 0..n {
             h.size[k] = (i + 1) as u8;
             k += 1;
             if k >= 257 {
@@ -175,7 +175,7 @@ fn build_huffman(s: &mut Context, h: &mut Huffman, count: &[i32; 16]) -> bool {
                 k += 1;
                 code += 1;
             }
-            if code - 1 >= (1u32 << j) {
+            if code > 1u32 << j {
                 return s.err("bad code lengths");
             }
         }
@@ -203,9 +203,8 @@ fn build_huffman(s: &mut Context, h: &mut Huffman, count: &[i32; 16]) -> bool {
 /// `stbi__build_fast_ac`: build a table that decodes both magnitude and value of small ACs in
 /// one go.
 fn build_fast_ac(fast_ac: &mut [i16; 1 << FAST_BITS], h: &Huffman) {
-    for i in 0..(1 << FAST_BITS) {
-        let fast = h.fast[i];
-        fast_ac[i] = 0;
+    for (i, (fast_ac, &fast)) in fast_ac.iter_mut().zip(&h.fast).enumerate() {
+        *fast_ac = 0;
         if fast < 255 {
             let rs = i32::from(h.values[usize::from(fast)]);
             let run = (rs >> 4) & 15;
@@ -222,7 +221,7 @@ fn build_fast_ac(fast_ac: &mut [i16; 1 << FAST_BITS], h: &Huffman) {
                 }
                 // if the result is small enough, we can fit it in fast_ac table
                 if (-128..=127).contains(&k) {
-                    fast_ac[i] = ((k * 256) + (run * 16) + (len + magbits)) as i16;
+                    *fast_ac = ((k * 256) + (run * 16) + (len + magbits)) as i16;
                 }
             }
         }
@@ -384,17 +383,28 @@ static STBI_JPEG_DEZIGZAG: [u8; 64 + 15] = [
     63, 63, 63, 63, 63, 63, 63,
 ];
 
+/// The tables one component's blocks are decoded with.
+struct BlockTables<'a> {
+    hdc: &'a Huffman,
+    hac: &'a Huffman,
+    fac: &'a [i16; 1 << FAST_BITS],
+    dequant: &'a [u16; 64],
+}
+
 /// `stbi__jpeg_decode_block`: decode one 64-entry block--
 fn jpeg_decode_block(
     j: &mut Entropy,
     s: &mut Context,
     data: &mut [i16; 64],
-    hdc: &Huffman,
-    hac: &Huffman,
-    fac: &[i16; 1 << FAST_BITS],
+    tables: &BlockTables,
     dc_pred: &mut i32,
-    dequant: &[u16; 64],
 ) -> bool {
+    let BlockTables {
+        hdc,
+        hac,
+        fac,
+        dequant,
+    } = *tables;
     if j.code_bits < 16 {
         grow_buffer_unsafe(j, s);
     }
@@ -684,7 +694,7 @@ fn fsh(x: i32) -> i32 {
 /// t3). (The sums wrap where the original's overflow, which only values no encoder writes
 /// bring about.)
 #[allow(clippy::excessive_precision)]
-fn idct_1d(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32, s6: i32, s7: i32) -> [i32; 8] {
+fn idct_1d([s0, s1, s2, s3, s4, s5, s6, s7]: [i32; 8]) -> [i32; 8] {
     const C0_5411961: i32 = f2f(0.5411961);
     const CN1_847759065: i32 = f2f(-1.847759065);
     const C0_765366865: i32 = f2f(0.765366865);
@@ -759,7 +769,7 @@ fn idct_block(out: &mut [u8], out_stride: usize, data: &[i16; 64]) {
             }
         } else {
             let [mut x0, mut x1, mut x2, mut x3, t0, t1, t2, t3] =
-                idct_1d(d(0), d(1), d(2), d(3), d(4), d(5), d(6), d(7));
+                idct_1d([d(0), d(1), d(2), d(3), d(4), d(5), d(6), d(7)]);
             // constants scaled things up by 1<<12; let's bring them back
             // down, but keep 2 extra bits of precision
             x0 = add(x0, 512);
@@ -781,8 +791,7 @@ fn idct_block(out: &mut [u8], out_stride: usize, data: &[i16; 64]) {
         let v = &val[i * 8..i * 8 + 8];
         let o = &mut out[i * out_stride..i * out_stride + 8];
         // no fast case since the first 1D IDCT spread components out
-        let [mut x0, mut x1, mut x2, mut x3, t0, t1, t2, t3] =
-            idct_1d(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        let [mut x0, mut x1, mut x2, mut x3, t0, t1, t2, t3] = idct_1d(v.try_into().unwrap());
         // constants scaled things up by 1<<12, plus we had 1<<2 from first
         // loop, plus horizontal and vertical each scale by sqrt(8) so together
         // we've got an extra 1<<3, so 1<<17 total we need to remove.
@@ -893,11 +902,13 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                         &mut z.e,
                         s,
                         &mut data,
-                        &z.huff_dc[comp.hd as usize],
-                        &z.huff_ac[ha],
-                        &z.fast_ac[ha],
+                        &BlockTables {
+                            hdc: &z.huff_dc[comp.hd as usize],
+                            hac: &z.huff_ac[ha],
+                            fac: &z.fast_ac[ha],
+                            dequant: &z.dequant[comp.tq as usize],
+                        },
                         &mut comp.dc_pred,
-                        &z.dequant[comp.tq as usize],
                     ) {
                         return false;
                     }
@@ -934,11 +945,13 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                                     &mut z.e,
                                     s,
                                     &mut data,
-                                    &z.huff_dc[comp.hd as usize],
-                                    &z.huff_ac[ha],
-                                    &z.fast_ac[ha],
+                                    &BlockTables {
+                                        hdc: &z.huff_dc[comp.hd as usize],
+                                        hac: &z.huff_ac[ha],
+                                        fac: &z.fast_ac[ha],
+                                        dequant: &z.dequant[comp.tq as usize],
+                                    },
                                     &mut comp.dc_pred,
-                                    &z.dequant[comp.tq as usize],
                                 ) {
                                     return false;
                                 }
@@ -1103,8 +1116,8 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
                     return s.err("bad DQT table");
                 }
 
-                for i in 0..64 {
-                    z.dequant[t][usize::from(STBI_JPEG_DEZIGZAG[i])] = if sixteen {
+                for &at in &STBI_JPEG_DEZIGZAG[..64] {
+                    z.dequant[t][usize::from(at)] = if sixteen {
                         s.get16be() as u16
                     } else {
                         u16::from(s.get8())
@@ -1311,23 +1324,23 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
     }
 
     z.rgb = 0;
-    for i in 0..s.img_n as usize {
-        static RGB: [u8; 3] = *b"RGB";
-        z.img_comp[i].id = i32::from(s.get8());
-        if s.img_n == 3 && z.img_comp[i].id == i32::from(RGB[i]) {
+    let n = s.img_n as usize;
+    for (i, comp) in z.img_comp[..n].iter_mut().enumerate() {
+        comp.id = i32::from(s.get8());
+        if n == 3 && comp.id == i32::from(b"RGB"[i]) {
             z.rgb += 1;
         }
         let q = i32::from(s.get8());
-        z.img_comp[i].h = q >> 4;
-        if z.img_comp[i].h == 0 || z.img_comp[i].h > 4 {
+        comp.h = q >> 4;
+        if comp.h == 0 || comp.h > 4 {
             return s.err("bad H");
         }
-        z.img_comp[i].v = q & 15;
-        if z.img_comp[i].v == 0 || z.img_comp[i].v > 4 {
+        comp.v = q & 15;
+        if comp.v == 0 || comp.v > 4 {
             return s.err("bad V");
         }
-        z.img_comp[i].tq = i32::from(s.get8());
-        if z.img_comp[i].tq > 3 {
+        comp.tq = i32::from(s.get8());
+        if comp.tq > 3 {
             return s.err("bad TQ");
         }
     }
@@ -1367,14 +1380,14 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
     z.img_mcu_w = h_max * 8;
     z.img_mcu_h = v_max * 8;
     // these sizes can't be more than 17 bits
-    z.img_mcu_x = ((s.img_x + z.img_mcu_w as u32 - 1) / z.img_mcu_w as u32) as i32;
-    z.img_mcu_y = ((s.img_y + z.img_mcu_h as u32 - 1) / z.img_mcu_h as u32) as i32;
+    z.img_mcu_x = s.img_x.div_ceil(z.img_mcu_w as u32) as i32;
+    z.img_mcu_y = s.img_y.div_ceil(z.img_mcu_h as u32) as i32;
 
     for i in 0..s.img_n as usize {
         let comp = &mut z.img_comp[i];
         // number of effective pixels (e.g. for non-interleaved MCU)
-        comp.x = ((s.img_x * comp.h as u32 + h_max as u32 - 1) / h_max as u32) as i32;
-        comp.y = ((s.img_y * comp.v as u32 + v_max as u32 - 1) / v_max as u32) as i32;
+        comp.x = (s.img_x * comp.h as u32).div_ceil(h_max as u32) as i32;
+        comp.y = (s.img_y * comp.v as u32).div_ceil(v_max as u32) as i32;
         // to simplify generation, we'll allocate enough memory to decode
         // the bogus oversized data from using interleaved MCUs and their
         // big blocks (e.g. a 16x16 iMCU on an image of width 33); we won't
@@ -1617,32 +1630,29 @@ const fn float2fixed(x: f32) -> i32 {
 
 /// `stbi__YCbCr_to_RGB_row`
 fn ycbcr_to_rgb_row(out: &mut [u8], y: &[u8], pcb: &[u8], pcr: &[u8], count: usize, step: usize) {
-    for i in 0..count {
-        let y_fixed = (i32::from(y[i]) << 20) + (1 << 19); // rounding
-        let cr = i32::from(pcr[i]) - 128;
-        let cb = i32::from(pcb[i]) - 128;
-        let mut r = y_fixed + cr * float2fixed(1.40200);
-        let mut g = y_fixed
+    let pixels = y[..count].iter().zip(&pcb[..count]).zip(&pcr[..count]);
+    let rgb = |((&y, &cb), &cr): ((&u8, &u8), &u8)| {
+        let y_fixed = (i32::from(y) << 20) + (1 << 19); // rounding
+        let cr = i32::from(cr) - 128;
+        let cb = i32::from(cb) - 128;
+        let r = y_fixed + cr * float2fixed(1.40200);
+        let g = y_fixed
             + (cr * -float2fixed(0.71414))
             + ((cb * -float2fixed(0.34414)) & 0xffff0000u32 as i32);
-        let mut b = y_fixed + cb * float2fixed(1.77200);
-        r >>= 20;
-        g >>= 20;
-        b >>= 20;
-        if r as u32 > 255 {
-            r = if r < 0 { 0 } else { 255 };
+        let b = y_fixed + cb * float2fixed(1.77200);
+        [r, g, b].map(|v| (v >> 20).clamp(0, 255) as u8)
+    };
+    if step == 4 {
+        for (out, pixel) in out.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
+            let [r, g, b] = rgb(pixel);
+            *out = [r, g, b, 255];
         }
-        if g as u32 > 255 {
-            g = if g < 0 { 0 } else { 255 };
+    } else {
+        // (The original writes a fourth byte here too, which the next pixel overwrites.)
+        debug_assert_eq!(step, 3);
+        for (out, pixel) in out.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+            *out = rgb(pixel);
         }
-        if b as u32 > 255 {
-            b = if b < 0 { 0 } else { 255 };
-        }
-        let out = &mut out[i * step..];
-        out[0] = r as u8;
-        out[1] = g as u8;
-        out[2] = b as u8;
-        out[3] = 255;
     }
 }
 
@@ -1718,17 +1728,16 @@ fn load_jpeg_image(z: &mut Jpeg, s: &mut Context, req_comp: i32) -> Option<(Vec<
     let img_x = s.img_x as usize;
     let mut res_comp = [ResampleState::default(); 4];
 
-    for k in 0..decode_n {
-        let r = &mut res_comp[k];
-
+    let (h_max, v_max) = (z.img_h_max, z.img_v_max);
+    for (r, comp) in res_comp.iter_mut().zip(&mut z.img_comp).take(decode_n) {
         // allocate line buffer big enough for upsampling off the edges
         // with upsample factor of 4
-        z.img_comp[k].linebuf = vec![0; img_x + 3];
+        comp.linebuf = vec![0; img_x + 3];
 
-        r.hs = z.img_h_max / z.img_comp[k].h;
-        r.vs = z.img_v_max / z.img_comp[k].v;
+        r.hs = h_max / comp.h;
+        r.vs = v_max / comp.v;
         r.ystep = r.vs >> 1;
-        r.w_lores = ((s.img_x + r.hs as u32 - 1) / r.hs as u32) as i32;
+        r.w_lores = s.img_x.div_ceil(r.hs as u32) as i32;
         r.ypos = 0;
         r.line0 = 0;
         r.line1 = 0;
@@ -1751,9 +1760,7 @@ fn load_jpeg_image(z: &mut Jpeg, s: &mut Context, req_comp: i32) -> Option<(Vec<
     // now go ahead and resample
     for j in 0..s.img_y as usize {
         let out = &mut output[n * img_x * j..];
-        for k in 0..decode_n {
-            let r = &mut res_comp[k];
-            let comp = &mut z.img_comp[k];
+        for (r, comp) in res_comp.iter_mut().zip(&mut z.img_comp).take(decode_n) {
             let y_bot = r.ystep >= (r.vs >> 1);
             let (near, far) = if y_bot {
                 (r.line1, r.line0)
@@ -1832,12 +1839,9 @@ fn load_jpeg_image(z: &mut Jpeg, s: &mut Context, req_comp: i32) -> Option<(Vec<
             }
         } else if is_rgb {
             if n == 1 {
-                for i in 0..img_x {
-                    out[i] = compute_y(
-                        i32::from(coutput(0)[i]),
-                        i32::from(coutput(1)[i]),
-                        i32::from(coutput(2)[i]),
-                    );
+                let (r, g, b) = (coutput(0), coutput(1), coutput(2));
+                for (((out, &r), &g), &b) in out[..img_x].iter_mut().zip(r).zip(g).zip(b) {
+                    *out = compute_y(i32::from(r), i32::from(g), i32::from(b));
                 }
             } else {
                 for i in 0..img_x {
@@ -1895,15 +1899,15 @@ pub(crate) fn jpeg_test(s: &mut Context) -> bool {
 }
 
 /// `stbi__jpeg_info`
-pub(crate) fn jpeg_info(s: &mut Context) -> Option<Info> {
+pub(crate) fn jpeg_info(s: &mut Context) -> Option<RawInfo> {
     let mut j = Jpeg::new();
     // stbi__jpeg_info_raw
     if !decode_jpeg_header(&mut j, s, Scan::Header) {
         s.rewind();
         return None;
     }
-    Some(Info {
-        kind: ImageType::Jpeg,
+    Some(RawInfo {
+        kind: ImageFormat::Jpeg,
         x: s.img_x as i32,
         y: s.img_y as i32,
         comp: if s.img_n >= 3 { 3 } else { 1 },
@@ -1915,7 +1919,7 @@ pub(crate) fn jpeg_info(s: &mut Context) -> Option<Info> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{LoadError, LoadOptions, info_from_memory, load_from_memory};
+    use super::super::{LoadError, LoadOptions, info, load};
     use super::*;
     use stb_image_write_nrp::{Channels, Image, WriteOptions, write_jpg};
 
@@ -1937,17 +1941,22 @@ mod tests {
                     quality,
                     &WriteOptions::default(),
                 );
-                let info = info_from_memory(&file).unwrap();
-                assert_eq!(
-                    (info.kind, info.x, info.y, info.comp),
-                    (ImageType::Jpeg, x as i32, y as i32, 3)
-                );
-                let loaded = load_from_memory(&file, 0, &options).unwrap();
+                let info = info(&file).unwrap();
                 assert_eq!(
                     (
-                        loaded.x,
-                        loaded.y,
-                        loaded.channels_in_file,
+                        info.format,
+                        info.width as i32,
+                        info.height as i32,
+                        info.channels as i32
+                    ),
+                    (ImageFormat::Jpeg, x as i32, y as i32, 3)
+                );
+                let loaded = load(&file, crate::ch(0), &options).unwrap();
+                assert_eq!(
+                    (
+                        loaded.width as i32,
+                        loaded.height as i32,
+                        loaded.channels_in_file as i32,
                         loaded.data.len()
                     ),
                     (x as i32, y as i32, 3, pixels.len())
@@ -1961,9 +1970,9 @@ mod tests {
                     .unwrap();
                 assert!(worst <= 12, "{x} by {y} at {quality}: off by {worst}");
                 // As grey, with alpha, and as four channels.
-                let grey = load_from_memory(&file, 1, &options).unwrap();
+                let grey = load(&file, crate::ch(1), &options).unwrap();
                 assert_eq!(grey.data.len(), x * y);
-                let grey_alpha = load_from_memory(&file, 2, &options).unwrap();
+                let grey_alpha = load(&file, crate::ch(2), &options).unwrap();
                 assert!(
                     grey_alpha
                         .data
@@ -1971,7 +1980,7 @@ mod tests {
                         .zip(&grey.data)
                         .all(|(pair, &value)| pair == [value, 255])
                 );
-                let rgba = load_from_memory(&file, 4, &options).unwrap();
+                let rgba = load(&file, crate::ch(4), &options).unwrap();
                 assert!(
                     rgba.data
                         .chunks(4)
@@ -1987,8 +1996,8 @@ mod tests {
             95,
             &WriteOptions::default(),
         );
-        let loaded = load_from_memory(&file, 1, &options).unwrap();
-        assert_eq!(loaded.channels_in_file, 3); // (the writer always writes three components)
+        let loaded = load(&file, crate::ch(1), &options).unwrap();
+        assert_eq!(loaded.channels_in_file as i32, 3); // (the writer always writes three components)
         assert!(
             loaded
                 .data
@@ -2040,26 +2049,26 @@ mod tests {
             90,
             &WriteOptions::default(),
         );
-        let refused = |file: &[u8]| load_from_memory(file, 0, &options).unwrap_err();
+        let refused = |file: &[u8]| load(file, crate::ch(0), &options).unwrap_err();
         // Cut short anywhere, it is refused.
-        assert_eq!(refused(&file[..2]), LoadError("expected marker"));
+        assert_eq!(refused(&file[..2]), LoadError::new("expected marker"));
         assert_eq!(
             refused(&file[..file.len() - 2]),
-            LoadError("expected marker")
+            LoadError::new("expected marker")
         );
-        assert!(load_from_memory(&file[..file.len() / 2], 0, &options).is_err());
+        assert!(load(&file[..file.len() / 2], crate::ch(0), &options).is_err());
         // Twelve bits a sample; no width.
         let frame = 25 + 64 + 1 + 64;
         let mut bad = file.clone();
         bad[frame + 4] = 12;
-        assert_eq!(refused(&bad), LoadError("only 8-bit"));
+        assert_eq!(refused(&bad), LoadError::new("only 8-bit"));
         let mut bad = file.clone();
         bad[frame + 7] = 0;
         bad[frame + 8] = 0;
-        assert_eq!(refused(&bad), LoadError("0 width"));
+        assert_eq!(refused(&bad), LoadError::new("0 width"));
         // A marker there is none of.
         let mut bad = file.clone();
         bad[3] = 0xC8;
-        assert_eq!(refused(&bad), LoadError("unknown marker"));
+        assert_eq!(refused(&bad), LoadError::new("unknown marker"));
     }
 }

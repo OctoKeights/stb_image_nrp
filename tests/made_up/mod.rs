@@ -1,5 +1,6 @@
-//! Made-up data, the same from a seed here as in the C side of the comparison
-//! (`compare/`), and the dumps the tests run as well as the comparison (`examples/dump.rs`).
+//! Synthetic data, generated from a seed exactly as the C side of the comparison
+//! (`compare/dump_stb_image.c`) generates it, and the dumps that both the golden tests and
+//! `examples/dump.rs` run.
 
 // (The arithmetic is written as the C side has it; not every user of this module uses all of
 // it.)
@@ -52,7 +53,7 @@ const WORDS: [&str; 16] = [
     "format", "is", "cube", "data",
 ];
 
-/// Made-up data of one of eight kinds, the same in both programs.
+/// Synthetic data of one of eight kinds, the same in both programs.
 pub fn make_data(r: &mut Random) -> Vec<u8> {
     let len = match r.next() % 8 {
         0 => r.next() % 16,
@@ -147,7 +148,7 @@ pub fn make_data(r: &mut Random) -> Vec<u8> {
     buf
 }
 
-/// A made-up image of 8 bits a channel: its channels, its size, how far its rows are apart,
+/// A synthetic image of 8 bits a channel: its channels, its size, how far its rows are apart,
 /// and its bytes, of one of seven kinds. What lies between the rows is 0xCD.
 pub struct Picture {
     pub w: i32,
@@ -249,7 +250,7 @@ fn chunk(f: &mut Vec<u8>, name: &[u8; 4], bytes: &[u8]) {
     p32be(f, 0);
 }
 
-/// A made-up PNG file: a header of any of the fifteen kinds, and made-up bytes as its rows.
+/// A synthetic PNG file: a header of any of the fifteen kinds, and synthetic bytes as its rows.
 pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
     const SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
     const DEPTH: [u8; 16] = [1, 2, 4, 8, 16, 8, 16, 1, 2, 4, 8, 8, 16, 8, 16, 8];
@@ -387,7 +388,7 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
     chunk(f, b"IEND", &[]);
 }
 
-/// A made-up BMP file: a header of any of the five sizes, and made-up bytes as its rows.
+/// A synthetic BMP file: a header of any of the five sizes, and synthetic bytes as its rows.
 pub fn make_bmp(r: &mut Random, f: &mut Vec<u8>) {
     const HSZ: [u32; 7] = [12, 40, 40, 40, 56, 108, 124];
     const BPP: [u32; 6] = [1, 4, 8, 16, 24, 32];
@@ -498,7 +499,7 @@ pub fn make_bmp(r: &mut Random, f: &mut Vec<u8>) {
     }
 }
 
-/// Made-up bytes for a JPEG scan: none of them the 0xFF that begins a marker, unless followed
+/// Synthetic bytes for a JPEG scan: none of them the 0xFF that begins a marker, unless followed
 /// by the zero that says it is none (and, once in a while, by whatever comes next).
 fn entropy_bytes(r: &mut Random, f: &mut Vec<u8>, n: u32, style: u32) {
     for _ in 0..n {
@@ -537,8 +538,8 @@ fn entropy(r: &mut Random, f: &mut Vec<u8>, blocks: u32, mcus: u32, restart: u32
     }
 }
 
-/// A made-up JPEG file: headers of every kind the reader takes, Huffman tables in which most
-/// bits mean something, and made-up bytes as the picture.
+/// A synthetic JPEG file: headers of every kind the reader takes, Huffman tables in which most
+/// bits mean something, and synthetic bytes as the picture.
 pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
     const COMPS: [u32; 5] = [1, 3, 3, 3, 4];
     const SAMPLING: [u8; 8] = [0x11, 0x22, 0x21, 0x12, 0x41, 0x22, 0x11, 0x42];
@@ -674,7 +675,7 @@ pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
         f.push(0x10 | t as u8);
         if ac_kind[t] == 0 {
             // 64 codes of seven bits and 128 of eight, which between them use every run of
-            // bits, for 192 made-up symbols.
+            // bits, for 192 synthetic symbols.
             for k in 1..=16 {
                 f.push(match k {
                     7 => 64,
@@ -769,17 +770,22 @@ pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
     }
 }
 
+/// The channels to ask for, as the C side numbers them: 0 for the file's.
+fn channels(count: i32) -> Option<stb_image_nrp::Channels> {
+    stb_image_nrp::Channels::from_count(count as u8)
+}
+
 /// Adds what a read came to: the size, the channels and the values, or the reason there are
 /// none. True when there were values.
 fn add_result<T: Copy, const N: usize>(
     hash: &mut Hash,
-    result: &Result<stb_image_nrp::Loaded<T>, stb_image_nrp::LoadError>,
+    result: &Result<stb_image_nrp::Image<T>, stb_image_nrp::LoadError>,
     bytes: fn(T) -> [u8; N],
 ) -> bool {
     match result {
         Ok(loaded) => {
-            hash.add(&(loaded.x as u32).to_le_bytes());
-            hash.add(&(loaded.y as u32).to_le_bytes());
+            hash.add(&loaded.width.to_le_bytes());
+            hash.add(&loaded.height.to_le_bytes());
             hash.add(&(loaded.channels_in_file as u32).to_le_bytes());
             for &value in &loaded.data {
                 hash.add(&bytes(value));
@@ -788,24 +794,20 @@ fn add_result<T: Copy, const N: usize>(
         }
         Err(error) => {
             hash.add(&0xffffffffu32.to_le_bytes());
-            hash.add(error.0.as_bytes());
+            hash.add(error.reason().as_bytes());
             hash.add(&[0]);
             false
         }
     }
 }
 
-/// The `stb_image` dump: made-up `.png`, `.bmp` and `.jpg` files, written by the port of
-/// stb_image_write and put together here with every kind of header and made-up bytes for the
+/// The `stb_image` dump: synthetic `.png`, `.bmp` and `.jpg` files, written by the port of
+/// stb_image_write and put together here with every kind of header and synthetic bytes for the
 /// picture, a third of them then damaged; each asked its size and read at 8 bits a channel,
-/// every third at 16; and for every fourth, made-up data through the zlib decoder.
+/// every third at 16; and for every fourth, synthetic data through the zlib decoder.
 pub fn stb_image(seed: u64, count: u32) -> String {
-    use stb_image_nrp::zlib::{
-        zlib_decode_buffer, zlib_decode_malloc, zlib_decode_noheader_malloc,
-    };
-    use stb_image_nrp::{
-        LoadOptions, info_from_memory, is_16_bit_from_memory, load_16_from_memory, load_from_memory,
-    };
+    use stb_image_nrp::zlib::{Format, decompress, decompress_with_limit};
+    use stb_image_nrp::{LoadOptions, info, is_16_bit, load, load_16};
     use stb_image_write_nrp::{
         Channels, Image, PngFilter, WriteOptions, write_bmp, write_jpg, write_png, zlib_compress,
     };
@@ -882,16 +884,16 @@ pub fn stb_image(seed: u64, count: u32) -> String {
         hash.add(&file);
         file_total += file.len() as u64;
 
-        let info = info_from_memory(&file);
+        let info = info(&file);
         let mut large = false;
         match &info {
             Ok(info) => {
-                let number = info.kind.number() as u32;
+                let number = info.format.code() as u32;
                 for value in [
                     number,
-                    info.x as u32,
-                    info.y as u32,
-                    info.comp as u32,
+                    info.width,
+                    info.height,
+                    info.channels as u32,
                     u32::from(info.is_16_bit),
                     u32::from(info.is_iphone_png),
                 ] {
@@ -903,19 +905,19 @@ pub fn stb_image(seed: u64, count: u32) -> String {
                     4 => 3,
                     _ => 0,
                 }] += 1;
-                large = u64::from(info.x as u32) * u64::from(info.y.unsigned_abs()) > 1 << 20;
+                large = u64::from(info.width) * u64::from(info.height) > 1 << 20;
             }
             Err(_) => {
                 hash.add(&0u32.to_le_bytes());
                 kinds[0] += 1;
             }
         }
-        hash.add(&u32::from(is_16_bit_from_memory(&file)).to_le_bytes());
+        hash.add(&u32::from(is_16_bit(&file)).to_le_bytes());
 
         let req = (r.next() % 5) as i32;
         let options = LoadOptions {
-            flip_vertically_on_load: r.next() % 4 == 0,
-            unpremultiply_on_load: r.next() % 2 != 0,
+            flip_vertically: r.next() % 4 == 0,
+            unpremultiply: r.next() % 2 != 0,
             convert_iphone_png_to_rgb: r.next() % 2 != 0,
             ..LoadOptions::default()
         };
@@ -924,18 +926,18 @@ pub fn stb_image(seed: u64, count: u32) -> String {
         if large {
             too_large += 1;
         } else {
-            let result = load_from_memory(&file, req, &options);
+            let result = load(&file, channels(req), &options);
             if add_result(&mut hash, &result, |value: u8| [value]) {
                 loaded += 1;
                 let image = result.unwrap();
-                pixel_total += image.x as u64 * image.y as u64;
+                pixel_total += u64::from(image.width) * u64::from(image.height);
             } else {
                 refused += 1;
             }
             if i % 3 == 0 {
                 add_result(
                     &mut hash,
-                    &load_16_from_memory(&file, req16, &options),
+                    &load_16(&file, channels(req16), &options),
                     u16::to_le_bytes,
                 );
             }
@@ -953,37 +955,37 @@ pub fn stb_image(seed: u64, count: u32) -> String {
                 let bit = r.next() % (z.len() as u32 * 8);
                 z[(bit >> 3) as usize] ^= 1 << (bit & 7);
             }
-            match zlib_decode_malloc(&z) {
+            match decompress(&z, Format::Zlib) {
                 Ok(bytes) => {
                     hash.add(&(bytes.len() as u32).to_le_bytes());
                     hash.add(&bytes);
                 }
                 Err(error) => {
-                    hash.add(error.0.as_bytes());
+                    hash.add(error.reason().as_bytes());
                     hash.add(&[0]);
                 }
             }
             // Into just enough room, or one byte too little.
             let room = data.len() - usize::from(!data.is_empty() && r.next() % 2 != 0);
-            match zlib_decode_buffer(room, &z) {
+            match decompress_with_limit(&z, Format::Zlib, room) {
                 Ok(bytes) => {
                     hash.add(&(bytes.len() as u32).to_le_bytes());
                     hash.add(&bytes);
                 }
                 Err(error) => {
                     hash.add(&0xffffffffu32.to_le_bytes());
-                    hash.add(error.0.as_bytes());
+                    hash.add(error.reason().as_bytes());
                     hash.add(&[0]);
                 }
             }
             // Without its header.
-            match zlib_decode_noheader_malloc(&z[2..]) {
+            match decompress(&z[2..], Format::Raw) {
                 Ok(bytes) => {
                     hash.add(&(bytes.len() as u32).to_le_bytes());
                     hash.add(&bytes);
                 }
                 Err(error) => {
-                    hash.add(error.0.as_bytes());
+                    hash.add(error.reason().as_bytes());
                     hash.add(&[0]);
                 }
             }
@@ -1041,7 +1043,7 @@ fn tga_pixel(r: &mut Random, f: &mut Vec<u8>, indexed: bool, pal_len: u32, bytes
     }
 }
 
-/// A made-up TGA file: palette or not, grey or colour, of every depth, raw or run-length
+/// A synthetic TGA file: palette or not, grey or colour, of every depth, raw or run-length
 /// encoded, either way up and round.
 pub fn make_tga(r: &mut Random, f: &mut Vec<u8>) {
     const PALETTE_BITS: [u32; 5] = [8, 15, 16, 24, 32];
@@ -1122,7 +1124,7 @@ pub fn make_tga(r: &mut Random, f: &mut Vec<u8>) {
     }
 }
 
-/// A made-up PSD file: none to five channels, 8 or 16 bits, raw or run-length encoded, with now
+/// A synthetic PSD file: none to five channels, 8 or 16 bits, raw or run-length encoded, with now
 /// and then mode data, resources and reserved bytes to skip.
 pub fn make_psd(r: &mut Random, f: &mut Vec<u8>) {
     let channels = r.next() % 6;
@@ -1290,8 +1292,8 @@ fn lzw_encode(f: &mut Vec<u8>, px: &[u8], mincs: u32, block_max: u32) {
     z.f.push(0);
 }
 
-/// A made-up GIF file: one to three frames, each with or without a graphic control extension
-/// (a delay, a transparent colour, a way of disposing of it) and a comment, at a made-up place,
+/// A synthetic GIF file: one to three frames, each with or without a graphic control extension
+/// (a delay, a transparent colour, a way of disposing of it) and a comment, at a synthetic place,
 /// with a local colour table or the global one, interlaced or not.
 pub fn make_gif(r: &mut Random, f: &mut Vec<u8>) {
     let big_w = 1 + r.next() % 40;
@@ -1422,7 +1424,7 @@ fn pnm_space(r: &mut Random, f: &mut Vec<u8>) {
     }
 }
 
-/// A made-up PNM file: grey or colour, binary or text, of every kind of maximum value.
+/// A synthetic PNM file: grey or colour, binary or text, of every kind of maximum value.
 pub fn make_pnm(r: &mut Random, f: &mut Vec<u8>) {
     const KINDS: [u8; 4] = *b"2356";
     let t = KINDS[(r.next() % 4) as usize];
@@ -1496,7 +1498,7 @@ fn hdr_byte(r: &mut Random, k: u32) -> u8 {
     }
 }
 
-/// A made-up Radiance HDR file: a header with lines to skip, then scanlines flat or run-length
+/// A synthetic Radiance HDR file: a header with lines to skip, then scanlines flat or run-length
 /// encoded.
 pub fn make_hdr(r: &mut Random, f: &mut Vec<u8>) {
     let w = if r.next() % 2 != 0 {
@@ -1566,15 +1568,12 @@ pub fn make_hdr(r: &mut Random, f: &mut Vec<u8>) {
     }
 }
 
-/// The `stb_image_more` dump: made-up `.tga`, `.psd`, `.gif`, `.pnm` and `.hdr` files, a third
+/// The `stb_image_more` dump: synthetic `.tga`, `.psd`, `.gif`, `.pnm` and `.hdr` files, a third
 /// of them damaged; each asked its size and whether it is HDR, read at 8 bits a channel, as
-/// floats and every other at 16, with a made-up gamma and scale; GIFs and every fourth file
+/// floats and every other at 16, with a synthetic gamma and scale; GIFs and every fourth file
 /// also read as an animation.
 pub fn stb_image_more(seed: u64, count: u32) -> String {
-    use stb_image_nrp::{
-        LoadOptions, info_from_memory, is_16_bit_from_memory, is_hdr_from_memory,
-        load_16_from_memory, load_from_memory, load_gif_from_memory, loadf_from_memory,
-    };
+    use stb_image_nrp::{LoadOptions, info, is_16_bit, is_hdr, load, load_16, load_f32, load_gif};
     const GAMMA: [f32; 4] = [2.2, 1.0, 1.8, 2.4];
     const SCALE: [f32; 4] = [1.0, 0.5, 2.0, 4.0];
     let mut r = Random { state: seed };
@@ -1597,29 +1596,29 @@ pub fn stb_image_more(seed: u64, count: u32) -> String {
         hash.add(&file);
         file_total += file.len() as u64;
 
-        let info = info_from_memory(&file);
+        let info = info(&file);
         let mut large = false;
         let mut number = 0;
         match &info {
             Ok(info) => {
-                number = info.kind.number() as u32;
+                number = info.format.code() as u32;
                 for value in [
                     number,
-                    info.x as u32,
-                    info.y as u32,
-                    info.comp as u32,
+                    info.width,
+                    info.height,
+                    info.channels as u32,
                     u32::from(info.is_16_bit),
                     u32::from(info.is_hdr),
                     u32::from(info.is_iphone_png),
                 ] {
                     hash.add(&value.to_le_bytes());
                 }
-                large = u64::from(info.x as u32) * u64::from(info.y.unsigned_abs()) > 1 << 20;
+                large = u64::from(info.width) * u64::from(info.height) > 1 << 20;
             }
             Err(_) => hash.add(&0u32.to_le_bytes()),
         }
-        hash.add(&u32::from(is_16_bit_from_memory(&file)).to_le_bytes());
-        hash.add(&u32::from(is_hdr_from_memory(&file)).to_le_bytes());
+        hash.add(&u32::from(is_16_bit(&file)).to_le_bytes());
+        hash.add(&u32::from(is_hdr(&file)).to_le_bytes());
         kinds[number as usize] += 1;
 
         let req = (r.next() % 5) as i32;
@@ -1634,7 +1633,7 @@ pub fn stb_image_more(seed: u64, count: u32) -> String {
             too_large += 1;
         } else {
             let options = LoadOptions {
-                flip_vertically_on_load: flip,
+                flip_vertically: flip,
                 hdr_to_ldr_gamma: gamma,
                 hdr_to_ldr_scale: scale,
                 ldr_to_hdr_gamma: gamma,
@@ -1643,7 +1642,7 @@ pub fn stb_image_more(seed: u64, count: u32) -> String {
             };
             if add_result(
                 &mut hash,
-                &load_from_memory(&file, req, &options),
+                &load(&file, channels(req), &options),
                 |value: u8| [value],
             ) {
                 loaded += 1;
@@ -1653,29 +1652,40 @@ pub fn stb_image_more(seed: u64, count: u32) -> String {
             if i % 2 == 0 {
                 add_result(
                     &mut hash,
-                    &load_16_from_memory(&file, req16, &options),
+                    &load_16(&file, channels(req16), &options),
                     u16::to_le_bytes,
                 );
             }
             add_result(
                 &mut hash,
-                &loadf_from_memory(&file, reqf, &options),
+                &load_f32(&file, channels(reqf), &options),
                 f32::to_le_bytes,
             );
             if number == 3 || i % 4 == 0 {
-                match load_gif_from_memory(&file, reqg, &options) {
+                match load_gif(&file, channels(reqg), &options) {
                     Ok(gif) => {
-                        for value in [gif.x, gif.y, gif.frames, gif.channels_in_file] {
-                            hash.add(&(value as u32).to_le_bytes());
+                        // (As the original gives them: the size of the last frame, and 4
+                        // channels when the header gives the size, which stand when there
+                        // is none.)
+                        let (x, y) = if gif.frames.is_empty() {
+                            (0, 0)
+                        } else {
+                            (gif.width, gif.height)
+                        };
+                        let in_file = if gif.width != 0 { 4 } else { 0 };
+                        for value in [x, y, gif.frames.len() as u32, in_file] {
+                            hash.add(&value.to_le_bytes());
                         }
-                        hash.add(&gif.data);
-                        for delay in gif.delays {
-                            hash.add(&delay.to_le_bytes());
+                        for frame in &gif.frames {
+                            hash.add(&frame.data);
+                        }
+                        for frame in gif.frames {
+                            hash.add(&frame.delay_ms.to_le_bytes());
                         }
                     }
                     Err(error) => {
                         hash.add(&0xffffffffu32.to_le_bytes());
-                        hash.add(error.0.as_bytes());
+                        hash.add(error.reason().as_bytes());
                         hash.add(&[0]);
                     }
                 }

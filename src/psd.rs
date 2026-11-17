@@ -2,7 +2,7 @@
 //! stb. The merged image of an RGB file only.
 
 use super::{
-    Context, ImageType, Info, Pixels, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid,
+    Context, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid,
 };
 
 /// `stbi__psd_test`
@@ -266,7 +266,7 @@ pub(crate) fn psd_load(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixe
 }
 
 /// `stbi__psd_info`
-pub(crate) fn psd_info(s: &mut Context) -> Option<Info> {
+pub(crate) fn psd_info(s: &mut Context) -> Option<RawInfo> {
     if s.get32be() != 0x38425053 {
         s.rewind();
         return None;
@@ -292,8 +292,8 @@ pub(crate) fn psd_info(s: &mut Context) -> Option<Info> {
         s.rewind();
         return None;
     }
-    Some(Info {
-        kind: ImageType::Psd,
+    Some(RawInfo {
+        kind: ImageFormat::Psd,
         x,
         y,
         comp: 4,
@@ -305,7 +305,7 @@ pub(crate) fn psd_info(s: &mut Context) -> Option<Info> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{LoadOptions, load_16_from_memory, load_from_memory};
+    use super::super::{LoadOptions, load, load_16};
 
     /// A PSD file of RGB, without the mode data, resources or reserved data.
     fn psd(channels: u16, w: u32, h: u32, depth: u16, compression: u16, data: &[u8]) -> Vec<u8> {
@@ -327,17 +327,24 @@ mod tests {
     fn channels_are_planes() {
         // Two pixels, three channels, one plane after another; alpha made opaque.
         let file = psd(3, 2, 1, 8, 0, &[10, 20, 30, 40, 50, 60]);
-        let image = load_from_memory(&file, 0, &LoadOptions::default()).unwrap();
-        assert_eq!((image.x, image.y, image.channels_in_file), (2, 1, 4));
+        let image = load(&file, crate::ch(0), &LoadOptions::default()).unwrap();
+        assert_eq!(
+            (
+                image.width as i32,
+                image.height as i32,
+                image.channels_in_file as i32
+            ),
+            (2, 1, 4)
+        );
         assert_eq!(image.data, [10, 30, 50, 255, 20, 40, 60, 255]);
     }
 
     #[test]
     fn sixteen_bits_stay_sixteen() {
         let file = psd(1, 1, 1, 16, 0, &[0x12, 0x34]);
-        let image = load_16_from_memory(&file, 1, &LoadOptions::default()).unwrap();
+        let image = load_16(&file, crate::ch(1), &LoadOptions::default()).unwrap();
         assert_eq!(image.data, [((0x1234u32 * 77) >> 8) as u16]);
-        let image = load_16_from_memory(&file, 4, &LoadOptions::default()).unwrap();
+        let image = load_16(&file, crate::ch(4), &LoadOptions::default()).unwrap();
         assert_eq!(image.data, [0x1234, 0, 0, 0xffff]);
     }
 
@@ -345,7 +352,7 @@ mod tests {
     fn run_length_encoding_is_read_by_channel() {
         // Four pixels of one channel: a run of three, then one literal; the row counts first.
         let file = psd(1, 4, 1, 8, 1, &[0, 0, 254, 7, 0, 9]);
-        let image = load_from_memory(&file, 1, &LoadOptions::default()).unwrap();
+        let image = load(&file, crate::ch(1), &LoadOptions::default()).unwrap();
         let (seven, nine) = (((7u32 * 77) >> 8) as u8, ((9u32 * 77) >> 8) as u8);
         assert_eq!(image.data, [seven, seven, seven, nine]);
     }

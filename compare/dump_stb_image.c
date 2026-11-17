@@ -1,23 +1,23 @@
-/* The C half of the comparison with stb_image.h (https://github.com/nothings/stb): reads made-up
+/* The C half of the comparison with stb_image.h (https://github.com/nothings/stb): reads synthetic
    image files and prints a running hash of the pixels that come out, or of the reason the file
    was refused. examples/dump.rs prints the same from the Rust port, and compare/compare.sh
    compares the two.
 
-     dump stb_image <seed> <count>   made-up files: pictures written by stb_image_write.h, and
+     dump stb_image <seed> <count>   synthetic files: pictures written by stb_image_write.h, and
                                      files put together here with every kind of header the
-                                     three readers take and made-up bytes for the picture
+                                     three readers take and synthetic bytes for the picture
                                      (PNG of every depth and colour type, with palettes,
                                      transparent colours and interlacing; BMP of every header
                                      size and depth, with palettes and bit masks; JPEG baseline
                                      and progressive, of one to four components sampled every
                                      way, with restart markers); a third of them then damaged.
                                      Each is asked its size, and read at 8 bits a channel with
-                                     a made-up number of channels asked for, and every third at
-                                     16 bits. And for every fourth, made-up data through the
+                                     a synthetic number of channels asked for, and every third at
+                                     16 bits. And for every fourth, synthetic data through the
                                      zlib decoder, whole and damaged.
 
      dump stb_image_more <seed> <count>
-                                     made-up files of the other formats: TGA of every kind
+                                     synthetic files of the other formats: TGA of every kind
                                      (grey, colour and palette, 8 to 32 bits, with and without
                                      run-length encoding, either way up and round); PSD of
                                      one to five channels, 8 and 16 bits, raw and run-length
@@ -28,7 +28,7 @@
                                      flat and run-length encoded. A third of them then
                                      damaged. Each is asked its size and whether it is HDR, read
                                      at 8 bits a channel, as floats and every other at 16 bits,
-                                     with a made-up gamma and scale; GIFs and every fourth file
+                                     with a synthetic gamma and scale; GIFs and every fourth file
                                      also read as an animation, every frame with its delay.
 
    stb_image.h is built with every reader, with its plain C in place of SSE2 (define WITH_SIMD
@@ -86,7 +86,7 @@ static void Chunk(Out *f, const char *name, const uint8_t *bytes, size_t size)
     P32be(f, 0);
 }
 
-/* A made-up PNG file: a header of any of the fifteen kinds, and made-up bytes as its rows. */
+/* A synthetic PNG file: a header of any of the fifteen kinds, and synthetic bytes as its rows. */
 static void MakePng(Out *f)
 {
     static const uint8_t kSig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
@@ -220,7 +220,7 @@ static void MakePng(Out *f)
     free(header.bytes);
 }
 
-/* A made-up BMP file: a header of any of the five sizes, and made-up bytes as its rows. */
+/* A synthetic BMP file: a header of any of the five sizes, and synthetic bytes as its rows. */
 static void MakeBmp(Out *f)
 {
     static const uint32_t kHsz[7] = { 12, 40, 40, 40, 56, 108, 124 };
@@ -318,7 +318,7 @@ static void MakeBmp(Out *f)
         P8(f, Next() >> 13);
 }
 
-/* Made-up bytes for a JPEG scan: none of them the 0xFF that begins a marker, unless followed
+/* Synthetic bytes for a JPEG scan: none of them the 0xFF that begins a marker, unless followed
    by the zero that says it is none (and, once in a while, by whatever comes next). */
 static void EntropyBytes(Out *f, uint32_t n, uint32_t style)
 {
@@ -358,8 +358,8 @@ static void Entropy(Out *f, uint32_t blocks, uint32_t mcus, uint32_t restart)
         EntropyBytes(f, blocks * (1 + Next() % 6), style);
 }
 
-/* A made-up JPEG file: headers of every kind the reader takes, Huffman tables in which most
-   bits mean something, and made-up bytes as the picture. */
+/* A synthetic JPEG file: headers of every kind the reader takes, Huffman tables in which most
+   bits mean something, and synthetic bytes as the picture. */
 static void MakeJpeg(Out *f)
 {
     static const uint32_t kComps[5] = { 1, 3, 3, 3, 4 };
@@ -472,7 +472,7 @@ static void MakeJpeg(Out *f)
         if (ac_kind[t] == 0)
         {
             /* 64 codes of seven bits and 128 of eight, which between them use every run of
-               bits, for 192 made-up symbols. */
+               bits, for 192 synthetic symbols. */
             for (k = 1; k <= 16; ++k)
                 P8(f, k == 7 ? 64 : k == 8 ? 128 : 0);
             for (k = 0; k < 192; ++k)
@@ -639,7 +639,7 @@ static void TgaPixel(Out *f, uint32_t indexed, uint32_t pal_len, uint32_t bytes)
             P8(f, Next() >> 9);
 }
 
-/* A made-up TGA file: palette or not, grey or colour, of every depth, raw or run-length
+/* A synthetic TGA file: palette or not, grey or colour, of every depth, raw or run-length
    encoded, either way up and round. */
 static void MakeTga(Out *f)
 {
@@ -725,7 +725,7 @@ static void MakeTga(Out *f)
     }
 }
 
-/* A made-up PSD file: none to five channels, 8 or 16 bits, raw or run-length encoded, with
+/* A synthetic PSD file: none to five channels, 8 or 16 bits, raw or run-length encoded, with
    now and then mode data, resources and reserved bytes to skip. */
 static void MakePsd(Out *f)
 {
@@ -902,8 +902,8 @@ static void LzwEncode(Out *f, const uint8_t *px, uint32_t n, uint32_t mincs, uin
     P8(f, 0);
 }
 
-/* A made-up GIF file: one to three frames, each with or without a graphic control extension
-   (a delay, a transparent colour, a way of disposing of it) and a comment, at a made-up place,
+/* A synthetic GIF file: one to three frames, each with or without a graphic control extension
+   (a delay, a transparent colour, a way of disposing of it) and a comment, at a synthetic place,
    with a local colour table or the global one, interlaced or not. */
 static void MakeGif(Out *f)
 {
@@ -1023,7 +1023,7 @@ static void PnmSpace(Out *f)
         P8(f, (uint32_t)kSpace[Next() % 6]);
 }
 
-/* A made-up PNM file: grey or colour, binary or text, of every kind of maximum value. */
+/* A synthetic PNM file: grey or colour, binary or text, of every kind of maximum value. */
 static void MakePnm(Out *f)
 {
     static const char kKinds[4] = { '2', '3', '5', '6' };
@@ -1084,7 +1084,7 @@ static uint32_t HdrByte(uint32_t k)
     return Next() % 8 == 0 ? 0 : 120 + Next() % 20;
 }
 
-/* A made-up Radiance HDR file: a header with lines to skip, then scanlines flat or run-length
+/* A synthetic Radiance HDR file: a header with lines to skip, then scanlines flat or run-length
    encoded. */
 static void MakeHdr(Out *f)
 {
@@ -1211,7 +1211,9 @@ static int MoreMain(uint32_t count)
         if (info.type != STBI_type_unsupported)
         {
             AddNumber((uint32_t)info.x);
-            AddNumber((uint32_t)info.y);
+            /* (The height as stb_image_nrp gives it: positive for a BMP stored top row first, of which
+               stb_image gives the negative.) */
+            AddNumber(info.y < 0 ? 0u - (uint32_t)info.y : (uint32_t)info.y);
             AddNumber((uint32_t)info.comp);
             AddNumber((uint32_t)info.is_16_bit);
             AddNumber((uint32_t)info.is_hdr);
@@ -1379,7 +1381,9 @@ int main(int argc, char **argv)
         if (info.type != STBI_type_unsupported)
         {
             AddNumber((uint32_t)info.x);
-            AddNumber((uint32_t)info.y);
+            /* (The height as stb_image_nrp gives it: positive for a BMP stored top row first, of which
+               stb_image gives the negative.) */
+            AddNumber(info.y < 0 ? 0u - (uint32_t)info.y : (uint32_t)info.y);
             AddNumber((uint32_t)info.comp);
             AddNumber((uint32_t)info.is_16_bit);
             AddNumber((uint32_t)info.is_iphone_png);

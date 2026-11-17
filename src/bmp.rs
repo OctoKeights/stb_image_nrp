@@ -1,7 +1,8 @@
 //! The BMP reader of `stb_image.h`: Microsoft/Windows BMP image.
 
 use super::{
-    Context, ImageType, Info, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid, vertical_flip,
+    Context, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid,
+    vertical_flip,
 };
 
 /// `stbi__bmp_test_raw`
@@ -531,7 +532,7 @@ pub(crate) fn bmp_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
 }
 
 /// `stbi__bmp_info`
-pub(crate) fn bmp_info(s: &mut Context) -> Option<Info> {
+pub(crate) fn bmp_info(s: &mut Context) -> Option<RawInfo> {
     let mut info = BmpData {
         all_a: 255,
         ..BmpData::default()
@@ -547,8 +548,8 @@ pub(crate) fn bmp_info(s: &mut Context) -> Option<Info> {
     } else {
         3
     };
-    Some(Info {
-        kind: ImageType::Bmp,
+    Some(RawInfo {
+        kind: ImageFormat::Bmp,
         x: s.img_x as i32,
         y: s.img_y as i32,
         comp,
@@ -560,7 +561,7 @@ pub(crate) fn bmp_info(s: &mut Context) -> Option<Info> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{LoadError, LoadOptions, info_from_memory, load_from_memory};
+    use super::super::{LoadError, LoadOptions, info, load};
     use super::*;
     use stb_image_write_nrp::{Channels, Image, WriteOptions, write_bmp};
 
@@ -593,13 +594,25 @@ mod tests {
             let image =
                 Image::new(&pixels, 7, 5, Channels::from_count(comp as u8).unwrap()).unwrap();
             let file = write_bmp(&image, &WriteOptions::default());
-            let loaded = load_from_memory(&file, 0, &options).unwrap();
-            assert_eq!((loaded.x, loaded.y, loaded.channels_in_file), (7, 5, comp));
-            assert_eq!(loaded.data, pixels);
-            let info = info_from_memory(&file).unwrap();
+            let loaded = load(&file, crate::ch(0), &options).unwrap();
             assert_eq!(
-                (info.kind, info.x, info.y, info.comp),
-                (ImageType::Bmp, 7, 5, comp)
+                (
+                    loaded.width as i32,
+                    loaded.height as i32,
+                    loaded.channels_in_file as i32
+                ),
+                (7, 5, comp)
+            );
+            assert_eq!(loaded.data, pixels);
+            let info = info(&file).unwrap();
+            assert_eq!(
+                (
+                    info.format,
+                    info.width as i32,
+                    info.height as i32,
+                    info.channels as i32
+                ),
+                (ImageFormat::Bmp, 7, 5, comp)
             );
         }
         // Grey comes back as three equal values.
@@ -608,10 +621,10 @@ mod tests {
             &WriteOptions::default(),
         );
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [7, 7, 7, 9, 9, 9]
         );
-        assert_eq!(load_from_memory(&file, 1, &options).unwrap().data, [7, 9]);
+        assert_eq!(load(&file, crate::ch(1), &options).unwrap().data, [7, 9]);
     }
 
     #[test]
@@ -637,7 +650,7 @@ mod tests {
                 0,
             ],
         );
-        let loaded = load_from_memory(&file, 0, &options).unwrap();
+        let loaded = load(&file, crate::ch(0), &options).unwrap();
         let (a, b) = ([10u8, 20, 30], [40u8, 50, 60]);
         let top: Vec<u8> = [a, a, a, a, a, a, a, b, b, b].concat();
         let bottom: Vec<u8> = [b, a, a, a, a, a, a, a, a, b].concat();
@@ -660,38 +673,38 @@ mod tests {
                 0,
             ],
         );
-        assert_eq!(info_from_memory(&file).unwrap().y, -2);
-        let loaded = load_from_memory(&file, 0, &options).unwrap();
-        assert_eq!(loaded.y, 2);
+        assert_eq!(info(&file).unwrap().height, 2);
+        let loaded = load(&file, crate::ch(0), &options).unwrap();
+        assert_eq!(loaded.height as i32, 2);
         assert_eq!(&loaded.data[..3], &b);
         // 4 and 8 bits a pixel.
         let file = bmp(3, 1, 4, 0, &palette, &[0x01, 0x10, 0, 0]);
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [a, b, b].concat()
         );
         let file = bmp(3, 1, 8, 0, &palette, &[1, 0, 1, 0]);
         assert_eq!(
-            load_from_memory(&file, 4, &options).unwrap().data,
+            load(&file, crate::ch(4), &options).unwrap().data,
             [40, 50, 60, 255, 10, 20, 30, 255, 40, 50, 60, 255]
         );
         // 16 bits: five each by default, or as three masks say (5, 6 and 5 here).
         let file = bmp(2, 1, 16, 0, &[], &[0x1f, 0x00, 0x00, 0x7c]);
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [0, 0, 255, 255, 0, 0]
         );
         let masks = [0x00, 0xf8, 0, 0, 0xe0, 0x07, 0, 0, 0x1f, 0, 0, 0];
         let file = bmp(2, 1, 16, 3, &masks, &[0xe0, 0x07, 0x10, 0x84]);
         assert_eq!(
-            load_from_memory(&file, 0, &options).unwrap().data,
+            load(&file, crate::ch(0), &options).unwrap().data,
             [0, 255, 0, 132, 130, 132]
         );
         // 32 bits with this header: no alpha.
         let file = bmp(1, 1, 32, 0, &[], &[1, 2, 3, 4]);
-        let loaded = load_from_memory(&file, 0, &options).unwrap();
+        let loaded = load(&file, crate::ch(0), &options).unwrap();
         assert_eq!(
-            (loaded.channels_in_file, &loaded.data[..]),
+            (loaded.channels_in_file as i32, &loaded.data[..]),
             (3, &[3u8, 2, 1][..])
         );
     }
@@ -699,26 +712,26 @@ mod tests {
     #[test]
     fn damaged_files_are_refused() {
         let options = LoadOptions::default();
-        let refused = |file: &[u8]| load_from_memory(file, 0, &options).unwrap_err();
+        let refused = |file: &[u8]| load(file, crate::ch(0), &options).unwrap_err();
         assert_eq!(
             refused(&bmp(2, 2, 8, 1, &[0; 8], &[0; 8])),
-            LoadError("BMP RLE")
+            LoadError::new("BMP RLE")
         );
         assert_eq!(
             refused(&bmp(2, 2, 24, 4, &[], &[0; 16])),
-            LoadError("BMP JPEG/PNG")
+            LoadError::new("BMP JPEG/PNG")
         );
         assert_eq!(
             refused(&bmp(2, 2, 24, 3, &[], &[0; 16])),
-            LoadError("bad BMP")
+            LoadError::new("bad BMP")
         );
         assert_eq!(
             refused(&bmp(2, 2, 8, 0, &[], &[0; 8])),
-            LoadError("invalid")
+            LoadError::new("invalid")
         );
         assert_eq!(
             refused(&bmp(2, 2, 2, 0, &[0; 16], &[0; 8])),
-            LoadError("bad bpp")
+            LoadError::new("bad bpp")
         );
         assert_eq!(
             refused(&bmp(
@@ -729,24 +742,24 @@ mod tests {
                 &[0x1f, 0, 0, 0, 0x1f, 0, 0, 0, 0x1f, 0, 0, 0],
                 &[0; 8]
             )),
-            LoadError("bad BMP")
+            LoadError::new("bad BMP")
         );
         assert_eq!(
             refused(&bmp(1 << 25, 2, 24, 0, &[], &[])),
-            LoadError("too large")
+            LoadError::new("too large")
         );
         assert_eq!(
             refused(&bmp(2, 2, 24, 0, &[0; 2000], &[0; 16])),
-            LoadError("bad offset")
+            LoadError::new("bad offset")
         );
         // A header of no known size is no BMP at all to the reader, and nothing else either.
         let mut file = bmp(2, 2, 24, 0, &[], &[0; 16]);
         file[14] = 41;
-        assert_eq!(refused(&file), LoadError("unknown image type"));
+        assert_eq!(refused(&file), LoadError::new("unknown image type"));
         // A file cut short reads as zeros where its bytes are missing.
         let file = bmp(2, 2, 24, 0, &[], &[9; 16]);
         assert_eq!(
-            load_from_memory(&file[..file.len() - 8], 0, &options)
+            load(&file[..file.len() - 8], crate::ch(0), &options)
                 .unwrap()
                 .data,
             [0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9]
