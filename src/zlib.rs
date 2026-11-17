@@ -668,7 +668,7 @@ mod tests {
             .map(|i| b"the quick brown fox "[(i % 20) as usize] ^ (i / 997) as u8)
             .collect();
         for level in [0, 1, 6, 9] {
-            let packed = miniz::compress(&text, level);
+            let packed = miniz::compress(&text, miniz::Level::new(level).unwrap());
             assert_eq!(zlib_decode_malloc(&packed).as_deref(), Ok(&text[..]));
             assert_eq!(
                 zlib_decode_buffer(text.len(), &packed).as_deref(),
@@ -729,7 +729,7 @@ mod tests {
             Err(LoadError("bad dist"))
         );
         // Cut short.
-        let packed = miniz::compress(&[7u8; 5000], 6);
+        let packed = miniz::compress(&[7u8; 5000], miniz::Level::new(6).unwrap());
         assert!(zlib_decode_malloc(&packed[..packed.len() - 6]).is_err());
     }
 }

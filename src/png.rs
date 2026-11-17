@@ -869,7 +869,7 @@ mod tests {
         load_from_memory,
     };
     use super::*;
-    use miniz_nrp::{self as miniz, mz_crc32};
+    use miniz_nrp::{self as miniz, Level, crc32};
     use stb_image_write_nrp::{WriteOptions, write_png};
 
     fn chunk(file: &mut Vec<u8>, name: &[u8; 4], bytes: &[u8]) {
@@ -877,7 +877,7 @@ mod tests {
         let from = file.len();
         file.extend_from_slice(name);
         file.extend_from_slice(bytes);
-        let crc = mz_crc32(0, &file[from..]);
+        let crc = crc32(&file[from..]);
         file.extend_from_slice(&crc.to_be_bytes());
     }
 
@@ -900,7 +900,11 @@ mod tests {
         for (name, bytes) in more {
             chunk(&mut file, name, bytes);
         }
-        chunk(&mut file, b"IDAT", &miniz::compress(rows, 6));
+        chunk(
+            &mut file,
+            b"IDAT",
+            &miniz::compress(rows, Level::new(6).unwrap()),
+        );
         chunk(&mut file, b"IEND", &[]);
         file
     }
@@ -1173,7 +1177,11 @@ mod tests {
         let mut file = vec![137, 80, 78, 71, 13, 10, 26, 10];
         chunk(&mut file, b"CgBI", &[0, 0, 0, 0]);
         chunk(&mut file, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
-        chunk(&mut file, b"IDAT", &miniz::compress(&rows, 6)[2..]);
+        chunk(
+            &mut file,
+            b"IDAT",
+            &miniz::compress(&rows, Level::new(6).unwrap())[2..],
+        );
         chunk(&mut file, b"IEND", &[]);
         let options = LoadOptions::default();
         assert!(info_from_memory(&file).unwrap().is_iphone_png);

@@ -312,7 +312,7 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
     let z = if r.next() % 4 == 0 {
         stb_image_write_nrp::zlib_compress(&raw, 5 + (r.next() % 8) as i32)
     } else {
-        miniz_nrp::compress(&raw, (r.next() % 10) as i32)
+        miniz_nrp::compress(&raw, miniz_nrp::Level::new((r.next() % 10) as u8).unwrap())
     };
 
     f.extend_from_slice(&SIG);
@@ -934,7 +934,7 @@ pub fn stb_image(seed: u64, count: u32) -> String {
             let mut z = if r.next() % 2 != 0 {
                 zlib_compress(&data, 5 + (r.next() % 8) as i32)
             } else {
-                miniz_nrp::compress(&data, (r.next() % 10) as i32)
+                miniz_nrp::compress(&data, miniz_nrp::Level::new((r.next() % 10) as u8).unwrap())
             };
             if r.next() % 3 == 0 {
                 let bit = r.next() % (z.len() as u32 * 8);
