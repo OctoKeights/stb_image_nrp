@@ -14,4 +14,4 @@ categories = ["multimedia::images", "encoding"]
 
 [dev-dependencies]
 miniz_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/miniz_nrp" }
-stb_image_write_nrp = { version = "0.1.0", git = "https://github.com/OctoKeights/stb_image_write_nrp" }
+stb_image_write_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/stb_image_write_nrp" }

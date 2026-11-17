@@ -562,7 +562,7 @@ pub(crate) fn bmp_info(s: &mut Context) -> Option<Info> {
 mod tests {
     use super::super::{LoadError, LoadOptions, info_from_memory, load_from_memory};
     use super::*;
-    use stb_image_write_nrp::{WriteOptions, write_bmp};
+    use stb_image_write_nrp::{Channels, Image, WriteOptions, write_bmp};
 
     /// A BMP file with the 40-byte header.
     fn bmp(x: i32, y: i32, bpp: u16, compress: u32, after_header: &[u8], rows: &[u8]) -> Vec<u8> {
@@ -590,7 +590,9 @@ mod tests {
             let pixels: Vec<u8> = (0..7 * 5 * comp)
                 .map(|i| (i * 37 + i / comp * 11) as u8 | 1)
                 .collect();
-            let file = write_bmp(7, 5, comp, &pixels, 0, &WriteOptions::default()).unwrap();
+            let image =
+                Image::new(&pixels, 7, 5, Channels::from_count(comp as u8).unwrap()).unwrap();
+            let file = write_bmp(&image, &WriteOptions::default());
             let loaded = load_from_memory(&file, 0, &options).unwrap();
             assert_eq!((loaded.x, loaded.y, loaded.channels_in_file), (7, 5, comp));
             assert_eq!(loaded.data, pixels);
@@ -601,7 +603,10 @@ mod tests {
             );
         }
         // Grey comes back as three equal values.
-        let file = write_bmp(2, 1, 1, &[7, 9], 0, &WriteOptions::default()).unwrap();
+        let file = write_bmp(
+            &Image::new(&[7, 9], 2, 1, Channels::Grey).unwrap(),
+            &WriteOptions::default(),
+        );
         assert_eq!(
             load_from_memory(&file, 0, &options).unwrap().data,
             [7, 7, 7, 9, 9, 9]

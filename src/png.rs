@@ -870,7 +870,7 @@ mod tests {
     };
     use super::*;
     use miniz_nrp::{self as miniz, Level, crc32};
-    use stb_image_write_nrp::{WriteOptions, write_png};
+    use stb_image_write_nrp::{Channels, Image, PngFilter, WriteOptions, write_png};
 
     fn chunk(file: &mut Vec<u8>, name: &[u8; 4], bytes: &[u8]) {
         file.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -922,25 +922,29 @@ mod tests {
         let options = LoadOptions::default();
         for comp in 1..=4 {
             let pixels = picture(19, 11, comp);
-            for filter in -1..5 {
+            let image =
+                Image::new(&pixels, 19, 11, Channels::from_count(comp as u8).unwrap()).unwrap();
+            for filter in [
+                None,
+                Some(PngFilter::None),
+                Some(PngFilter::Sub),
+                Some(PngFilter::Up),
+                Some(PngFilter::Average),
+                Some(PngFilter::Paeth),
+            ] {
                 let file = write_png(
-                    &pixels,
-                    0,
-                    19,
-                    11,
-                    comp as i32,
+                    &image,
                     &WriteOptions {
-                        force_png_filter: filter,
+                        png_filter: filter,
                         ..WriteOptions::default()
                     },
-                )
-                .unwrap();
+                );
                 let loaded = load_from_memory(&file, 0, &options).unwrap();
                 assert_eq!(
                     (loaded.x, loaded.y, loaded.channels_in_file),
                     (19, 11, comp as i32)
                 );
-                assert_eq!(loaded.data, pixels, "{comp} channels, filter {filter}");
+                assert_eq!(loaded.data, pixels, "{comp} channels, filter {filter:?}");
                 let info = info_from_memory(&file).unwrap();
                 assert_eq!(
                     (info.kind, info.x, info.y, info.comp, info.is_16_bit),
@@ -948,8 +952,7 @@ mod tests {
                 );
             }
             // Other numbers of channels than the file has.
-            let file =
-                write_png(&pixels, 0, 19, 11, comp as i32, &WriteOptions::default()).unwrap();
+            let file = write_png(&image, &WriteOptions::default());
             for wanted in 1..=4 {
                 let loaded = load_from_memory(&file, wanted, &options).unwrap();
                 assert_eq!(loaded.channels_in_file, comp as i32);

@@ -310,7 +310,7 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
     }
 
     let z = if r.next() % 4 == 0 {
-        stb_image_write_nrp::zlib_compress(&raw, 5 + (r.next() % 8) as i32)
+        stb_image_write_nrp::zlib_compress(&raw, 5 + r.next() % 8)
     } else {
         miniz_nrp::compress(&raw, miniz_nrp::Level::new((r.next() % 10) as u8).unwrap())
     };
@@ -806,7 +806,9 @@ pub fn stb_image(seed: u64, count: u32) -> String {
     use stb_image_nrp::{
         LoadOptions, info_from_memory, is_16_bit_from_memory, load_16_from_memory, load_from_memory,
     };
-    use stb_image_write_nrp::{WriteOptions, write_bmp, write_jpg, write_png, zlib_compress};
+    use stb_image_write_nrp::{
+        Channels, Image, PngFilter, WriteOptions, write_bmp, write_jpg, write_png, zlib_compress,
+    };
     let mut r = Random { state: seed };
     let mut hash = Hash::new();
     let (mut loaded, mut refused, mut too_large) = (0u32, 0u32, 0u32);
@@ -819,24 +821,35 @@ pub fn stb_image(seed: u64, count: u32) -> String {
         if kind < 3 {
             let p = make_picture(&mut r);
             let options = WriteOptions {
-                png_compression_level: 5 + (r.next() % 8) as i32,
-                force_png_filter: (r.next() % 6) as i32 - 1,
-                flip_vertically_on_write: false,
+                png_compression_level: 5 + r.next() % 8,
+                // (The C side's -1 to 4: the best filter of each row, or a filter.)
+                png_filter: match r.next() % 6 {
+                    0 => None,
+                    k => Some(
+                        [
+                            PngFilter::None,
+                            PngFilter::Sub,
+                            PngFilter::Up,
+                            PngFilter::Average,
+                            PngFilter::Paeth,
+                        ][k as usize - 1],
+                    ),
+                },
+                flip_vertically: false,
             };
+            let image = Image::with_stride(
+                &p.bytes,
+                p.w as u32,
+                p.h as u32,
+                Channels::from_count(p.comp as u8).unwrap(),
+                p.stride,
+            )
+            .unwrap();
             file = match kind {
-                0 => write_png(&p.bytes, p.stride, p.w, p.h, p.comp, &options),
-                1 => write_bmp(p.w, p.h, p.comp, &p.bytes, p.stride, &options),
-                _ => write_jpg(
-                    p.w,
-                    p.h,
-                    p.comp,
-                    &p.bytes,
-                    1 + (r.next() % 100) as i32,
-                    p.stride,
-                    &options,
-                ),
-            }
-            .expect("a file");
+                0 => write_png(&image, &options),
+                1 => write_bmp(&image, &options),
+                _ => write_jpg(&image, 1 + (r.next() % 100) as u8, &options),
+            };
         } else if kind < 5 {
             make_png(&mut r, &mut file);
         } else if kind == 5 {
@@ -932,7 +945,7 @@ pub fn stb_image(seed: u64, count: u32) -> String {
         if i % 4 == 0 {
             let data = make_data(&mut r);
             let mut z = if r.next() % 2 != 0 {
-                zlib_compress(&data, 5 + (r.next() % 8) as i32)
+                zlib_compress(&data, 5 + r.next() % 8)
             } else {
                 miniz_nrp::compress(&data, miniz_nrp::Level::new((r.next() % 10) as u8).unwrap())
             };

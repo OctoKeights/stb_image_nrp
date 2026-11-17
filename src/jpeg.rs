@@ -1917,7 +1917,7 @@ pub(crate) fn jpeg_info(s: &mut Context) -> Option<Info> {
 mod tests {
     use super::super::{LoadError, LoadOptions, info_from_memory, load_from_memory};
     use super::*;
-    use stb_image_write_nrp::{WriteOptions, write_jpg};
+    use stb_image_write_nrp::{Channels, Image, WriteOptions, write_jpg};
 
     fn picture(x: usize, y: usize, comp: usize) -> Vec<u8> {
         // Smooth, so that it comes back near what went in.
@@ -1933,15 +1933,10 @@ mod tests {
             for quality in [90, 100] {
                 let pixels = picture(x, y, 3);
                 let file = write_jpg(
-                    x as i32,
-                    y as i32,
-                    3,
-                    &pixels,
+                    &Image::new(&pixels, x as u32, y as u32, Channels::Rgb).unwrap(),
                     quality,
-                    0,
                     &WriteOptions::default(),
-                )
-                .unwrap();
+                );
                 let info = info_from_memory(&file).unwrap();
                 assert_eq!(
                     (info.kind, info.x, info.y, info.comp),
@@ -1987,7 +1982,11 @@ mod tests {
         }
         // A grey file.
         let pixels = picture(20, 20, 1);
-        let file = write_jpg(20, 20, 1, &pixels, 95, 0, &WriteOptions::default()).unwrap();
+        let file = write_jpg(
+            &Image::new(&pixels, 20, 20, Channels::Grey).unwrap(),
+            95,
+            &WriteOptions::default(),
+        );
         let loaded = load_from_memory(&file, 1, &options).unwrap();
         assert_eq!(loaded.channels_in_file, 3); // (the writer always writes three components)
         assert!(
@@ -2036,7 +2035,11 @@ mod tests {
     fn damaged_files_are_refused() {
         let options = LoadOptions::default();
         let pixels = picture(24, 24, 3);
-        let file = write_jpg(24, 24, 3, &pixels, 90, 0, &WriteOptions::default()).unwrap();
+        let file = write_jpg(
+            &Image::new(&pixels, 24, 24, Channels::Rgb).unwrap(),
+            90,
+            &WriteOptions::default(),
+        );
         let refused = |file: &[u8]| load_from_memory(file, 0, &options).unwrap_err();
         // Cut short anywhere, it is refused.
         assert_eq!(refused(&file[..2]), LoadError("expected marker"));
