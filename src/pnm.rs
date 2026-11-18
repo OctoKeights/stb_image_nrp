@@ -49,8 +49,8 @@ fn pnm_getinteger(s: &mut Context, c: &mut u8) -> i32 {
         value = value * 10 + i32::from(*c - b'0');
         *c = s.get8();
         // (The original's `char` is signed: a byte from 0x80 up is below '7'.)
-        if value > 214748364 || (value == 214748364 && (*c as i8) > b'7' as i8) {
-            s.err("integer parse overflow");
+        if value > 214_748_364 || (value == 214_748_364 && (*c as i8) > b'7' as i8) {
+            s.set_reason("integer parse overflow");
             return 0;
         }
     }
@@ -97,24 +97,24 @@ fn pnm_info_internal(s: &mut Context) -> (i32, PnmHeader) {
 
     header.x = pnm_getinteger(s, &mut c); // read width
     if header.x == 0 {
-        s.err("invalid width");
+        s.set_reason("invalid width");
         return (0, header);
     }
     pnm_skip_whitespace(s, &mut c);
 
     header.y = pnm_getinteger(s, &mut c); // read height
     if header.y == 0 {
-        s.err("invalid width");
+        s.set_reason("invalid width");
         return (0, header);
     }
     pnm_skip_whitespace(s, &mut c);
 
     header.maxv = pnm_getinteger(s, &mut c); // read max value
     let bits = if header.maxv == 0 {
-        s.err("invalid maxv");
+        s.set_reason("invalid maxv");
         0
     } else if header.maxv > 65535 {
-        s.err("max value > 65535");
+        s.set_reason("max value > 65535");
         0
     } else if header.maxv > 255 {
         16
@@ -151,11 +151,7 @@ pub(crate) fn pnm_load(s: &mut Context, req_comp: i32) -> Option<(Pixels, i32)> 
     let maxv = header.maxv;
     let nvals = (s.img_n * s.img_x as i32 * s.img_y as i32) as usize;
     let mut out = vec![0u8; nvals * bpv as usize];
-    if !header.isascii {
-        if !s.getn_into(&mut out) {
-            return s.errp("bad PNM");
-        }
-    } else {
+    if header.isascii {
         let mut c = s.get8();
         for i in 0..nvals {
             pnm_skip_whitespace(s, &mut c);
@@ -173,6 +169,8 @@ pub(crate) fn pnm_load(s: &mut Context, req_comp: i32) -> Option<(Pixels, i32)> 
                 out[i * 2 + 1] = val as u8;
             }
         }
+    } else if s.getn_into(&mut out).is_err() {
+        return s.errp("bad PNM");
     }
 
     // expected_maxv conversion

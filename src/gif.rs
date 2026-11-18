@@ -2,8 +2,8 @@
 //! stb. Every frame of an animation, or the first.
 
 use super::{
-    Channels, Context, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, addints_valid, convert_format,
-    mad3sizes_valid, vertical_flip,
+    Channels, Context, Failed, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, addints_valid,
+    convert_format, mad3sizes_valid, vertical_flip,
 };
 
 /// Every frame of a GIF file, as [`super::load_gif`] reads it.
@@ -171,17 +171,17 @@ fn gif_parse_colortable(s: &mut Context, pal: &mut [[u8; 3]; 256], num_entries: 
 }
 
 /// `stbi__gif_header`
-fn gif_header(s: &mut Context, g: &mut Gif, is_info: bool) -> bool {
+fn gif_header(s: &mut Context, g: &mut Gif, is_info: bool) -> Result<(), Failed> {
     if s.get8() != b'G' || s.get8() != b'I' || s.get8() != b'F' || s.get8() != b'8' {
-        return s.err("not GIF");
+        return s.fail("not GIF");
     }
 
     let version = s.get8();
     if version != b'7' && version != b'9' {
-        return s.err("not GIF");
+        return s.fail("not GIF");
     }
     if s.get8() != b'a' {
-        return s.err("not GIF");
+        return s.fail("not GIF");
     }
 
     s.reason = "";
@@ -193,17 +193,17 @@ fn gif_header(s: &mut Context, g: &mut Gif, is_info: bool) -> bool {
     g.transparent = -1;
 
     if g.w > STBI_MAX_DIMENSIONS as i32 || g.h > STBI_MAX_DIMENSIONS as i32 {
-        return s.err("too large");
+        return s.fail("too large");
     }
     if g.w == 0 || g.h == 0 {
-        return s.err("zero pixels");
+        return s.fail("zero pixels");
     }
 
     // (The channels: always 4, can't actually tell whether it's 3 or 4 until we parse the
     // comments.)
 
     if is_info {
-        return true;
+        return Ok(());
     }
 
     if g.flags & 0x80 != 0 {
@@ -212,13 +212,13 @@ fn gif_header(s: &mut Context, g: &mut Gif, is_info: bool) -> bool {
         g.bgindex = -1; // no global color table -> bg color ignored
     }
 
-    true
+    Ok(())
 }
 
 /// `stbi__gif_info_raw`
 fn gif_info_raw(s: &mut Context) -> Option<(i32, i32)> {
     let mut g = Gif::new();
-    if !gif_header(s, &mut g, true) {
+    if gif_header(s, &mut g, true).is_err() {
         s.rewind();
         return None;
     }
@@ -226,10 +226,12 @@ fn gif_info_raw(s: &mut Context) -> Option<(i32, i32)> {
 }
 
 /// `stbi__process_gif_raster`: false where the original gives NULL.
-fn process_gif_raster(s: &mut Context, g: &mut Gif) -> bool {
+// (One pass, step for step as stb_image's, its state shared throughout.)
+#[allow(clippy::too_many_lines)]
+fn process_gif_raster(s: &mut Context, g: &mut Gif) -> Result<(), Failed> {
     let lzw_cs = s.get8();
     if lzw_cs > 12 {
-        return false;
+        return Err(Failed);
     }
     let clear = 1i32 << lzw_cs;
     let mut first = true;
@@ -253,7 +255,7 @@ fn process_gif_raster(s: &mut Context, g: &mut Gif) -> bool {
             if len == 0 {
                 len = i32::from(s.get8()); // start new block
                 if len == 0 {
-                    return true;
+                    return Ok(());
                 }
             }
             len -= 1;
@@ -282,10 +284,10 @@ fn process_gif_raster(s: &mut Context, g: &mut Gif) -> bool {
                 }
                 s.skip(len);
             }
-            return true;
+            return Ok(());
         } else if code <= avail {
             if first {
-                return s.err("no clear code");
+                return s.fail("no clear code");
             }
 
             let mut revind = 4096usize;
@@ -293,7 +295,7 @@ fn process_gif_raster(s: &mut Context, g: &mut Gif) -> bool {
             if code == avail {
                 // self-reference case
                 if oldcode < 0 {
-                    return s.err("illegal code in raster");
+                    return s.fail("illegal code in raster");
                 }
                 // chase oldcode to find its first character
                 cur = oldcode;
@@ -304,7 +306,7 @@ fn process_gif_raster(s: &mut Context, g: &mut Gif) -> bool {
                     // the original goes round for ever; here the file is refused.)
                     steps += 1;
                     if steps > 4096 {
-                        return s.err("illegal code in raster");
+                        return s.fail("illegal code in raster");
                     }
                 }
                 // add the first character at the end of revbuf; consumes 1 slot
@@ -319,7 +321,7 @@ fn process_gif_raster(s: &mut Context, g: &mut Gif) -> bool {
             // "prefix" link to a lower-numbered code
             while cur >= clear {
                 if revind <= 1 {
-                    return s.err("illegal code in raster"); // (as above)
+                    return s.fail("illegal code in raster"); // (as above)
                 }
                 revind -= 1;
                 revbuf[revind] = g.suffix(cur as usize);
@@ -372,7 +374,7 @@ fn process_gif_raster(s: &mut Context, g: &mut Gif) -> bool {
                 revind += 1;
             }
         } else {
-            return s.err("illegal code in raster");
+            return s.fail("illegal code in raster");
         }
     }
 }
@@ -385,17 +387,20 @@ enum Next {
 }
 
 /// `stbi__gif_load_next`: this function is designed to support animated gifs, although
-/// stb_image doesn't support it. `saved` is the frame to go back to, for a very specific
+/// `stb_image` doesn't support it. `saved` is the frame to go back to, for a very specific
 /// disposal format.
+// (One pass, step for step as stb_image's, its state shared throughout; the names are stb_image's,
+// so that the code reads against the original.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
     // on first frame, any non-written pixels get the background colour (non-transparent)
     let mut first_frame = false;
     if g.out.is_empty() {
-        if !gif_header(s, g, false) {
+        if gif_header(s, g, false).is_err() {
             return Next::Failed; // stbi__g_failure_reason set by stbi__gif_header
         }
         if !mad3sizes_valid(4, g.w, g.h, 0) {
-            s.err("too large");
+            s.set_reason("too large");
             return Next::Failed;
         }
         g.out = vec![0; 4 * g.w as usize * g.h as usize]; // clear to transparent
@@ -446,7 +451,7 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
                 let w = s.get16le();
                 let h = s.get16le();
                 if x + w > g.w || y + h > g.h {
-                    s.err("bad Image Descriptor");
+                    s.set_reason("bad Image Descriptor");
                     return Next::Failed;
                 }
 
@@ -482,7 +487,7 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
                 } else if g.flags & 0x80 != 0 {
                     g.color_table = Table::Global;
                 } else {
-                    s.err("missing color table");
+                    s.set_reason("missing color table");
                     return Next::Failed;
                 }
 
@@ -497,7 +502,7 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
                     }
                 }
 
-                return if process_gif_raster(s, g) {
+                return if process_gif_raster(s, g).is_ok() {
                     Next::Frame
                 } else {
                     Next::Failed
@@ -539,7 +544,7 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
             }
 
             _ => {
-                s.err("unknown code");
+                s.set_reason("unknown code");
                 return Next::Failed;
             }
         }
@@ -573,7 +578,8 @@ pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<Animation>
         // we ensure g.w > 0, g.h > 0; that means totalbytes > 0 and this check
         // also guarantees that layers doesn't overflow
         if !addints_valid(totalbytes, stride) {
-            ok = s.err("toobig");
+            s.set_reason("toobig");
+            ok = false;
             break;
         }
         totalbytes += stride;

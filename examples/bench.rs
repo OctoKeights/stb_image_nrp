@@ -1,4 +1,4 @@
-//! Decoding throughput on synthetic 1024 by 768 images, written with stb_image_write_nrp.
+//! Decoding throughput on synthetic 1024 by 768 images, written with `stb_image_write_nrp`.
 //!
 //! ```sh
 //! cargo run --release --example bench
@@ -19,8 +19,8 @@ fn photo_like(w: usize, h: usize) -> Vec<u8> {
     for y in 0..h {
         for x in 0..w {
             state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             let noise = (state >> 61) as usize;
             let flat = (x / 128 + y / 128) % 5 == 0;
             for c in 0..3 {
@@ -36,7 +36,7 @@ fn photo_like(w: usize, h: usize) -> Vec<u8> {
 }
 
 /// The files the benchmark reads: PNG, JPEG at qualities 90 and 95, and BMP.
-pub fn files() -> Vec<(&'static str, Vec<u8>)> {
+fn files() -> Vec<(&'static str, Vec<u8>)> {
     let (w, h) = (1024, 768);
     let pixels = photo_like(w, h);
     let image = write::Image::new(&pixels, w as u32, h as u32, write::Channels::Rgb).unwrap();

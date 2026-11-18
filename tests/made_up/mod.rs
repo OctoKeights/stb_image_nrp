@@ -2,18 +2,13 @@
 //! (`compare/dump_stb_image.c`) generates it, and the dumps that both the golden tests and
 //! `examples/dump.rs` run.
 
-// (The arithmetic is written as the C side has it; not every user of this module uses all of
-// it.)
-#![allow(
-    clippy::manual_is_multiple_of,
-    clippy::needless_range_loop,
-    clippy::manual_div_ceil,
-    clippy::manual_checked_ops,
-    dead_code
-)]
+// (The golden tests and the dump each use only part of this module.)
+#![allow(dead_code)]
 
 /// The two programs make the same blocks from the same seed: a 64-bit linear congruential
 /// generator, the high half of its state.
+use std::fmt::Write;
+
 pub struct Random {
     pub state: u64,
 }
@@ -22,8 +17,8 @@ impl Random {
     pub fn next(&mut self) -> u32 {
         self.state = self
             .state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         (self.state >> 32) as u32
     }
 }
@@ -36,14 +31,14 @@ pub struct Hash {
 impl Hash {
     pub fn new() -> Hash {
         Hash {
-            value: 14695981039346656037,
+            value: 14_695_981_039_346_656_037,
         }
     }
 
     pub fn add(&mut self, data: &[u8]) {
         for &byte in data {
             self.value ^= u64::from(byte);
-            self.value = self.value.wrapping_mul(1099511628211);
+            self.value = self.value.wrapping_mul(1_099_511_628_211);
         }
     }
 }
@@ -61,7 +56,7 @@ pub fn make_data(r: &mut Random) -> Vec<u8> {
         2 | 3 => r.next() % 5000,
         4 | 5 => r.next() % 40000,
         6 => 60000 + r.next() % 20000,
-        _ => r.next() % 200000,
+        _ => r.next() % 200_000,
     } as usize;
     let kind = r.next() % 8;
     let mut buf = Vec::with_capacity(len);
@@ -107,7 +102,7 @@ pub fn make_data(r: &mut Random) -> Vec<u8> {
         // copies of what came before
         4 => {
             while buf.len() < len {
-                if buf.len() < 64 || r.next() % 4 == 0 {
+                if buf.len() < 64 || r.next().is_multiple_of(4) {
                     buf.push((r.next() >> 9) as u8);
                 } else {
                     let reach = buf.len().min(40000);
@@ -173,7 +168,7 @@ pub fn make_picture(r: &mut Random) -> Picture {
     };
     let (w, h) = (w as usize, h as usize);
     let stride = w * comp
-        + if r.next() % 3 == 0 {
+        + if r.next().is_multiple_of(3) {
             (r.next() % 7) as usize
         } else {
             0
@@ -208,9 +203,8 @@ pub fn make_picture(r: &mut Random) -> Picture {
                     0 => r.next() >> 13,           // noise
                     1 => palette[0][c],            // one colour
                     2 => slope,                    // a slope
-                    3 => palette[pick][c],         // squares
                     4 => slope + r.next() % noise, // a slope with noise on it
-                    5 => palette[pick][c],         // a few colours, anywhere
+                    3 | 5 => palette[pick][c],     // squares; a few colours, anywhere
                     _ => wave(along),              // waves
                 };
                 bytes[y * stride + x * comp + c] = value as u8;
@@ -243,14 +237,16 @@ fn p32le(f: &mut Vec<u8>, value: u32) {
 }
 
 /// A chunk of a PNG file. (No checksum: the reader does not look at it.)
-fn chunk(f: &mut Vec<u8>, name: &[u8; 4], bytes: &[u8]) {
+fn chunk(f: &mut Vec<u8>, name: [u8; 4], bytes: &[u8]) {
     p32be(f, bytes.len() as u32);
-    f.extend_from_slice(name);
+    f.extend_from_slice(&name);
     f.extend_from_slice(bytes);
     p32be(f, 0);
 }
 
 /// A synthetic PNG file: a header of any of the fifteen kinds, and synthetic bytes as its rows.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
     const SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
     const DEPTH: [u8; 16] = [1, 2, 4, 8, 16, 8, 16, 1, 2, 4, 8, 8, 16, 8, 16, 8];
@@ -263,16 +259,16 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
     let kind = (r.next() % 16) as usize;
     let (depth, color) = (u32::from(DEPTH[kind]), u32::from(COLOR[kind]));
     let channels = u32::from(CHANNELS[color as usize]);
-    let (w, h) = if r.next() % 8 == 0 {
+    let (w, h) = if r.next().is_multiple_of(8) {
         let w = 1 + r.next() % 200;
         (w, 1 + r.next() % 120)
     } else {
         let w = 1 + r.next() % 40;
         (w, 1 + r.next() % 40)
     };
-    let interlace = r.next() % 3 == 0;
+    let interlace = r.next().is_multiple_of(3);
     let style = r.next() % 3;
-    let iphone = r.next() % 16 == 0;
+    let iphone = r.next().is_multiple_of(16);
 
     // The rows, each behind its filter: of the whole image, or of each of the seven passes.
     let mut raw = Vec::new();
@@ -285,10 +281,10 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
         if pw == 0 || ph == 0 {
             continue;
         }
-        let row_bytes = (pw * channels * depth + 7) / 8;
+        let row_bytes = (pw * channels * depth).div_ceil(8);
         for y in 0..ph {
             let mut filter = r.next() % 5;
-            if r.next() % 4000 == 0 {
+            if r.next().is_multiple_of(4000) {
                 filter = 5 + r.next() % 3;
             }
             raw.push(filter as u8);
@@ -310,7 +306,7 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
         raw.extend_from_slice(&[0; 5]);
     }
 
-    let z = if r.next() % 4 == 0 {
+    let z = if r.next().is_multiple_of(4) {
         stb_image_write_nrp::zlib_compress(&raw, 5 + r.next() % 8)
     } else {
         miniz_nrp::compress(&raw, miniz_nrp::Level::new((r.next() % 10) as u8).unwrap())
@@ -318,40 +314,40 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
 
     f.extend_from_slice(&SIG);
     if iphone {
-        chunk(f, b"CgBI", &[0; 4]);
+        chunk(f, *b"CgBI", &[0; 4]);
     }
     let mut header = Vec::new();
     p32be(&mut header, w);
     p32be(&mut header, h);
     header.extend_from_slice(&[depth as u8, color as u8, 0, 0, u8::from(interlace)]);
-    chunk(f, b"IHDR", &header);
-    if r.next() % 4 == 0 {
-        chunk(f, b"tEXt", b"made up\0text");
+    chunk(f, *b"IHDR", &header);
+    if r.next().is_multiple_of(4) {
+        chunk(f, *b"tEXt", b"made up\0text");
     }
     // A palette: nearly always where one is needed, now and then where none is.
     let mut pal_len = 0u32;
     if if color == 3 {
-        r.next() % 20 != 0
+        !r.next().is_multiple_of(20)
     } else {
-        r.next() % 8 == 0
+        r.next().is_multiple_of(8)
     } {
         pal_len = 1 + r.next() % 256;
         let bytes: Vec<u8> = (0..pal_len * 3).map(|_| (r.next() >> 12) as u8).collect();
-        chunk(f, b"PLTE", &bytes);
+        chunk(f, *b"PLTE", &bytes);
     }
     // Transparency: alphas for a palette, or the one colour that is to be clear.
-    if r.next() % 3 == 0 {
+    if r.next().is_multiple_of(3) {
         let mut n = 0;
         if color == 3 {
             n = 1 + r.next() % if pal_len != 0 { pal_len } else { 1 };
-            if r.next() % 30 == 0 {
+            if r.next().is_multiple_of(30) {
                 n = pal_len + 1;
             }
         } else if color == 0 {
             n = 2;
         } else if color == 2 {
             n = 6;
-        } else if r.next() % 10 == 0 {
+        } else if r.next().is_multiple_of(10) {
             n = 2;
         }
         if n > 256 {
@@ -367,12 +363,12 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
             })
             .collect();
         if n != 0 {
-            chunk(f, b"tRNS", &bytes);
+            chunk(f, *b"tRNS", &bytes);
         }
     }
     let parts = 1 + r.next() % 3;
-    if r.next() % 16 == 0 {
-        chunk(f, b"IDAT", &[]);
+    if r.next().is_multiple_of(16) {
+        chunk(f, *b"IDAT", &[]);
     }
     // (An iPhone file's stream has no zlib header.)
     let mut at = if iphone && z.len() > 2 { 2 } else { 0 };
@@ -382,13 +378,15 @@ pub fn make_png(r: &mut Random, f: &mut Vec<u8>) {
         } else {
             r.next() as usize % (z.len() - at + 1)
         };
-        chunk(f, b"IDAT", &z[at..at + n]);
+        chunk(f, *b"IDAT", &z[at..at + n]);
         at += n;
     }
-    chunk(f, b"IEND", &[]);
+    chunk(f, *b"IEND", &[]);
 }
 
 /// A synthetic BMP file: a header of any of the five sizes, and synthetic bytes as its rows.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::too_many_lines)]
 pub fn make_bmp(r: &mut Random, f: &mut Vec<u8>) {
     const HSZ: [u32; 7] = [12, 40, 40, 40, 56, 108, 124];
     const BPP: [u32; 6] = [1, 4, 8, 16, 24, 32];
@@ -397,30 +395,30 @@ pub fn make_bmp(r: &mut Random, f: &mut Vec<u8>) {
     let mut compress = 0;
     let mut masks = [0u32; 4];
     let (mut psize, mut extra) = (0u32, 0u32);
-    if r.next() % 40 == 0 {
-        bpp = if r.next() % 2 != 0 { 2 } else { 20 };
+    if r.next().is_multiple_of(40) {
+        bpp = if r.next().is_multiple_of(2) { 20 } else { 2 };
     }
-    if (bpp == 16 || bpp == 32) && r.next() % 2 != 0 {
+    if (bpp == 16 || bpp == 32) && !r.next().is_multiple_of(2) {
         compress = 3;
     }
-    if r.next() % 50 == 0 {
+    if r.next().is_multiple_of(50) {
         compress = 1 + r.next() % 4;
     }
     let w = 1 + r.next() % 40;
     let h = 1 + r.next() % 40;
-    let top_down = hsz != 12 && r.next() % 4 == 0;
+    let top_down = hsz != 12 && r.next().is_multiple_of(4);
     let mask_style = r.next() % 3;
     if mask_style == 0 {
         masks = if bpp == 16 {
             [0xf800, 0x07e0, 0x001f, 0]
         } else {
-            [0xff0000, 0xff00, 0xff, 0xff000000]
+            [0x00ff_0000, 0xff00, 0xff, 0xff00_0000]
         };
     } else if mask_style == 1 {
         masks = if bpp == 16 {
             [0x7c00, 0x03e0, 0x001f, 0x8000]
         } else {
-            [0xff, 0xff00, 0xff0000, 0xff000000]
+            [0xff, 0xff00, 0x00ff_0000, 0xff00_0000]
         };
     } else {
         for mask in &mut masks {
@@ -432,11 +430,11 @@ pub fn make_bmp(r: &mut Random, f: &mut Vec<u8>) {
     }
     if bpp < 16 {
         psize = 1 << bpp;
-        if r.next() % 4 == 0 {
+        if r.next().is_multiple_of(4) {
             psize = 1 + r.next() % psize;
         }
     }
-    if r.next() % 10 == 0 {
+    if r.next().is_multiple_of(10) {
         extra = 1 + r.next() % 20;
     }
     let offset = 14
@@ -488,10 +486,10 @@ pub fn make_bmp(r: &mut Random, f: &mut Vec<u8>) {
     for _ in 0..psize * if hsz == 12 { 3 } else { 4 } + extra {
         f.push((r.next() >> 10) as u8);
     }
-    let row_bytes = ((w * bpp + 31) / 32) * 4;
+    let row_bytes = (w * bpp).div_ceil(32) * 4;
     let mut pixels_size = row_bytes * h;
     // Now and then cut short.
-    if r.next() % 10 == 0 {
+    if r.next().is_multiple_of(10) {
         pixels_size -= r.next() % (pixels_size / 2 + 1);
     }
     for _ in 0..pixels_size {
@@ -504,14 +502,14 @@ pub fn make_bmp(r: &mut Random, f: &mut Vec<u8>) {
 fn entropy_bytes(r: &mut Random, f: &mut Vec<u8>, n: u32, style: u32) {
     for _ in 0..n {
         let mut b = (r.next() >> 11) & 255;
-        if style == 1 && r.next() % 4 != 0 {
+        if style == 1 && !r.next().is_multiple_of(4) {
             b = 0;
         }
         if style == 2 {
             b &= 0x0f;
         }
         f.push(b as u8);
-        if b == 0xff && r.next() % 64 != 0 {
+        if b == 0xff && !r.next().is_multiple_of(64) {
             f.push(0);
         }
     }
@@ -523,7 +521,7 @@ fn entropy_bytes(r: &mut Random, f: &mut Vec<u8>, n: u32, style: u32) {
 fn entropy(r: &mut Random, f: &mut Vec<u8>, blocks: u32, mcus: u32, restart: u32) {
     let style = r.next() % 3;
     if restart != 0 {
-        let segments = r.next() % ((mcus + restart - 1) / restart);
+        let segments = r.next() % mcus.div_ceil(restart);
         for k in 0..segments {
             let n = r.next() % (restart / 2 + 2);
             entropy_bytes(r, f, n, style);
@@ -540,6 +538,8 @@ fn entropy(r: &mut Random, f: &mut Vec<u8>, blocks: u32, mcus: u32, restart: u32
 
 /// A synthetic JPEG file: headers of every kind the reader takes, Huffman tables in which most
 /// bits mean something, and synthetic bytes as the picture.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
     const COMPS: [u32; 5] = [1, 3, 3, 3, 4];
     const SAMPLING: [u8; 8] = [0x11, 0x22, 0x21, 0x12, 0x41, 0x22, 0x11, 0x42];
@@ -557,40 +557,44 @@ pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
             0x51, 0x30,
         ],
     ];
-    let progressive = r.next() % 2 != 0;
+    let progressive = !r.next().is_multiple_of(2);
     let ncomp = COMPS[(r.next() % 5) as usize];
     let w = 1 + r.next() % 64;
     let h = 1 + r.next() % 64;
     let y_sampling = u32::from(SAMPLING[(r.next() % 8) as usize]);
-    let rgb_ids = r.next() % 8 == 0;
+    let rgb_ids = r.next().is_multiple_of(8);
     let (mut dc_kind, mut ac_kind, mut ac_offset) = ([0usize; 2], [0u32; 2], [0u32; 2]);
     let mut restart = 0;
     for t in 0..2 {
         dc_kind[t] = DC_PICK[(r.next() % 5) as usize];
         ac_kind[t] = r.next() % 3;
-        ac_offset[t] = if r.next() % 2 != 0 { 0 } else { r.next() & 255 };
+        ac_offset[t] = if r.next().is_multiple_of(2) {
+            r.next() & 255
+        } else {
+            0
+        };
     }
-    if r.next() % 3 == 0 {
+    if r.next().is_multiple_of(3) {
         restart = 1 + r.next() % 8;
     }
 
     p16be(f, 0xffd8);
-    if r.next() % 2 != 0 {
+    if !r.next().is_multiple_of(2) {
         p16be(f, 0xffe0);
         p16be(f, 16);
         f.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
     }
     if if ncomp == 4 {
-        r.next() % 4 != 0
+        !r.next().is_multiple_of(4)
     } else {
-        r.next() % 3 == 0
+        r.next().is_multiple_of(3)
     } {
         p16be(f, 0xffee);
         p16be(f, 14);
         f.extend_from_slice(b"Adobe\0\x64\0\0\0\0");
         f.push((r.next() % 3) as u8);
     }
-    if r.next() % 4 == 0 {
+    if r.next().is_multiple_of(4) {
         let n = r.next() % 20;
         p16be(f, 0xfffe);
         p16be(f, 2 + n);
@@ -600,8 +604,8 @@ pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
     }
 
     // Two tables of divisors, of one byte a value or of two.
-    let sixteen = r.next() % 6 == 0;
-    let range = if r.next() % 3 == 0 { 64 } else { 4 };
+    let sixteen = r.next().is_multiple_of(6);
+    let range = if r.next().is_multiple_of(3) { 64 } else { 4 };
     p16be(f, 0xffdb);
     p16be(f, 2 + 2 * if sixteen { 129 } else { 65 });
     for t in 0..2u8 {
@@ -625,7 +629,7 @@ pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
     f.push(0xff);
     f.push(if progressive {
         0xc2
-    } else if r.next() % 4 == 0 {
+    } else if r.next().is_multiple_of(4) {
         0xc1
     } else {
         0xc0
@@ -642,15 +646,15 @@ pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
         } else {
             c as u32 + 1
         };
-        hv[c] = if c == 0 || (c == 3 && r.next() % 2 != 0) {
+        hv[c] = if c == 0 || (c == 3 && !r.next().is_multiple_of(2)) {
             y_sampling
         } else {
             0x11
         };
-        f.extend_from_slice(&[id[c] as u8, hv[c] as u8, if c == 0 { 0 } else { 1 }]);
+        f.extend_from_slice(&[id[c] as u8, hv[c] as u8, u8::from(c != 0)]);
     }
     let (hmax, vmax) = (y_sampling >> 4, y_sampling & 15);
-    let mcus = ((w + 8 * hmax - 1) / (8 * hmax)) * ((h + 8 * vmax - 1) / (8 * vmax));
+    let mcus = w.div_ceil(8 * hmax) * h.div_ceil(8 * vmax);
     let blocks = mcus * (hmax * vmax + ncomp - 1);
 
     // The Huffman tables: two for the first values of blocks, two for the rest.
@@ -701,42 +705,18 @@ pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
 
     // The scans.
     let selectors = |c: usize| if c == 0 { 0x00 } else { 0x11 };
-    if !progressive {
-        if ncomp > 1 && r.next() % 3 == 0 {
-            for c in 0..ncomp as usize {
-                p16be(f, 0xffda);
-                p16be(f, 8);
-                f.extend_from_slice(&[1, id[c] as u8, selectors(c), 0, 63, 0]);
-                entropy(r, f, blocks, mcus, restart);
-                if c == 0 && r.next() % 16 == 0 {
-                    let lines = if r.next() % 8 == 0 { h + 1 } else { h };
-                    p16be(f, 0xffdc);
-                    p16be(f, 4);
-                    p16be(f, lines);
-                }
-            }
-        } else {
-            p16be(f, 0xffda);
-            p16be(f, 6 + 2 * ncomp);
-            f.push(ncomp as u8);
-            for c in 0..ncomp as usize {
-                f.extend_from_slice(&[id[c] as u8, selectors(c)]);
-            }
-            f.extend_from_slice(&[0, 63, 0]);
-            entropy(r, f, blocks, mcus, restart);
-        }
-    } else {
+    if progressive {
         let scans = 1 + r.next() % 6;
         for scan in 0..scans {
             let what = if scan == 0 { 0 } else { r.next() % 4 };
             let (mut ah, mut ss, mut se, mut first, mut n) = (0, 0, 0, 0, ncomp);
-            if r.next() % 3 == 0 {
+            if r.next().is_multiple_of(3) {
                 ah = 1 + r.next() % 2;
             }
             let al = if ah != 0 { ah - 1 } else { r.next() % 2 };
             if what == 0 {
                 // The first values of blocks: of all the components together, or of one.
-                if r.next() % 4 == 0 {
+                if r.next().is_multiple_of(4) {
                     first = r.next() % ncomp;
                     n = 1;
                 }
@@ -750,22 +730,44 @@ pub fn make_jpeg(r: &mut Random, f: &mut Vec<u8>) {
             p16be(f, 0xffda);
             p16be(f, 6 + 2 * n);
             f.push(n as u8);
-            for c in first as usize..(first + n) as usize {
-                f.extend_from_slice(&[id[c] as u8, selectors(c)]);
+            for (c, &cid) in id.iter().enumerate().skip(first as usize).take(n as usize) {
+                f.extend_from_slice(&[cid as u8, selectors(c)]);
             }
             f.extend_from_slice(&[ss as u8, se as u8, ((ah << 4) | al) as u8]);
             entropy(r, f, blocks, mcus, restart);
         }
+    } else if ncomp > 1 && r.next().is_multiple_of(3) {
+        for (c, &cid) in id.iter().enumerate().take(ncomp as usize) {
+            p16be(f, 0xffda);
+            p16be(f, 8);
+            f.extend_from_slice(&[1, cid as u8, selectors(c), 0, 63, 0]);
+            entropy(r, f, blocks, mcus, restart);
+            if c == 0 && r.next().is_multiple_of(16) {
+                let lines = if r.next().is_multiple_of(8) { h + 1 } else { h };
+                p16be(f, 0xffdc);
+                p16be(f, 4);
+                p16be(f, lines);
+            }
+        }
+    } else {
+        p16be(f, 0xffda);
+        p16be(f, 6 + 2 * ncomp);
+        f.push(ncomp as u8);
+        for (c, &cid) in id.iter().enumerate().take(ncomp as usize) {
+            f.extend_from_slice(&[cid as u8, selectors(c)]);
+        }
+        f.extend_from_slice(&[0, 63, 0]);
+        entropy(r, f, blocks, mcus, restart);
     }
 
     // The end: now and then bytes that mean nothing before it, or no end.
-    if r.next() % 10 == 0 {
+    if r.next().is_multiple_of(10) {
         let n = r.next() % 6;
         for _ in 0..n {
             f.push(((r.next() >> 10) & 0x7f) as u8);
         }
     }
-    if r.next() % 30 != 0 {
+    if !r.next().is_multiple_of(30) {
         p16be(f, 0xffd9);
     }
 }
@@ -793,7 +795,7 @@ fn add_result<T: Copy, const N: usize>(
             true
         }
         Err(error) => {
-            hash.add(&0xffffffffu32.to_le_bytes());
+            hash.add(&0xffff_ffff_u32.to_le_bytes());
             hash.add(error.reason().as_bytes());
             hash.add(&[0]);
             false
@@ -802,9 +804,11 @@ fn add_result<T: Copy, const N: usize>(
 }
 
 /// The `stb_image` dump: synthetic `.png`, `.bmp` and `.jpg` files, written by the port of
-/// stb_image_write and put together here with every kind of header and synthetic bytes for the
+/// `stb_image_write` and put together here with every kind of header and synthetic bytes for the
 /// picture, a third of them then damaged; each asked its size and read at 8 bits a channel,
 /// every third at 16; and for every fourth, synthetic data through the zlib decoder.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::too_many_lines)]
 pub fn stb_image(seed: u64, count: u32) -> String {
     use stb_image_nrp::zlib::{Format, decompress, decompress_with_limit};
     use stb_image_nrp::{LoadOptions, info, is_16_bit, load, load_16};
@@ -861,10 +865,10 @@ pub fn stb_image(seed: u64, count: u32) -> String {
         }
 
         // A third of them damaged: bits turned over, the end cut off, or a byte made up.
-        if r.next() % 3 == 0 {
+        if r.next().is_multiple_of(3) {
             match r.next() % 4 {
                 0 => {
-                    for _ in 0..1 + r.next() % 3 {
+                    for _ in 0..=(r.next() % 3) {
                         let bit = r.next() % (file.len() as u32 * 8);
                         file[(bit >> 3) as usize] ^= 1 << (bit & 7);
                     }
@@ -886,39 +890,36 @@ pub fn stb_image(seed: u64, count: u32) -> String {
 
         let info = info(&file);
         let mut large = false;
-        match &info {
-            Ok(info) => {
-                let number = info.format.code() as u32;
-                for value in [
-                    number,
-                    info.width,
-                    info.height,
-                    info.channels as u32,
-                    u32::from(info.is_16_bit),
-                    u32::from(info.is_iphone_png),
-                ] {
-                    hash.add(&value.to_le_bytes());
-                }
-                kinds[match number {
-                    1 => 1,
-                    2 => 2,
-                    4 => 3,
-                    _ => 0,
-                }] += 1;
-                large = u64::from(info.width) * u64::from(info.height) > 1 << 20;
+        if let Ok(info) = &info {
+            let number = info.format.code() as u32;
+            for value in [
+                number,
+                info.width,
+                info.height,
+                info.channels as u32,
+                u32::from(info.is_16_bit),
+                u32::from(info.is_iphone_png),
+            ] {
+                hash.add(&value.to_le_bytes());
             }
-            Err(_) => {
-                hash.add(&0u32.to_le_bytes());
-                kinds[0] += 1;
-            }
+            kinds[match number {
+                1 => 1,
+                2 => 2,
+                4 => 3,
+                _ => 0,
+            }] += 1;
+            large = u64::from(info.width) * u64::from(info.height) > 1 << 20;
+        } else {
+            hash.add(&0u32.to_le_bytes());
+            kinds[0] += 1;
         }
         hash.add(&u32::from(is_16_bit(&file)).to_le_bytes());
 
         let req = (r.next() % 5) as i32;
         let options = LoadOptions {
-            flip_vertically: r.next() % 4 == 0,
-            unpremultiply: r.next() % 2 != 0,
-            convert_iphone_png_to_rgb: r.next() % 2 != 0,
+            flip_vertically: r.next().is_multiple_of(4),
+            unpremultiply: !r.next().is_multiple_of(2),
+            convert_iphone_png_to_rgb: !r.next().is_multiple_of(2),
             ..LoadOptions::default()
         };
         let req16 = (r.next() % 5) as i32;
@@ -946,12 +947,12 @@ pub fn stb_image(seed: u64, count: u32) -> String {
         // The zlib decoder by itself.
         if i % 4 == 0 {
             let data = make_data(&mut r);
-            let mut z = if r.next() % 2 != 0 {
-                zlib_compress(&data, 5 + r.next() % 8)
-            } else {
+            let mut z = if r.next().is_multiple_of(2) {
                 miniz_nrp::compress(&data, miniz_nrp::Level::new((r.next() % 10) as u8).unwrap())
+            } else {
+                zlib_compress(&data, 5 + r.next() % 8)
             };
-            if r.next() % 3 == 0 {
+            if r.next().is_multiple_of(3) {
                 let bit = r.next() % (z.len() as u32 * 8);
                 z[(bit >> 3) as usize] ^= 1 << (bit & 7);
             }
@@ -966,14 +967,14 @@ pub fn stb_image(seed: u64, count: u32) -> String {
                 }
             }
             // Into just enough room, or one byte too little.
-            let room = data.len() - usize::from(!data.is_empty() && r.next() % 2 != 0);
+            let room = data.len() - usize::from(!data.is_empty() && !r.next().is_multiple_of(2));
             match decompress_with_limit(&z, Format::Zlib, room) {
                 Ok(bytes) => {
                     hash.add(&(bytes.len() as u32).to_le_bytes());
                     hash.add(&bytes);
                 }
                 Err(error) => {
-                    hash.add(&0xffffffffu32.to_le_bytes());
+                    hash.add(&0xffff_ffff_u32.to_le_bytes());
                     hash.add(error.reason().as_bytes());
                     hash.add(&[0]);
                 }
@@ -992,7 +993,7 @@ pub fn stb_image(seed: u64, count: u32) -> String {
         }
 
         if (i + 1) % 200 == 0 || i + 1 == count {
-            out += &format!("stb_image {} {:016x}\n", i + 1, hash.value);
+            writeln!(out, "stb_image {} {:016x}", i + 1, hash.value).unwrap();
         }
     }
     out + &format!(
@@ -1003,10 +1004,10 @@ pub fn stb_image(seed: u64, count: u32) -> String {
 
 /// Damages a third of the files: bits turned over, the end cut off, or a byte made up.
 fn damage_stb_file(r: &mut Random, file: &mut Vec<u8>) {
-    if r.next() % 3 == 0 {
+    if r.next().is_multiple_of(3) {
         match r.next() % 4 {
             0 => {
-                for _ in 0..1 + r.next() % 3 {
+                for _ in 0..=(r.next() % 3) {
                     let bit = r.next() % (file.len() as u32 * 8);
                     file[(bit >> 3) as usize] ^= 1 << (bit & 7);
                 }
@@ -1027,7 +1028,7 @@ fn damage_stb_file(r: &mut Random, file: &mut Vec<u8>) {
 /// A pixel of a TGA file: an index into its palette (now and then one past its end), or bytes.
 fn tga_pixel(r: &mut Random, f: &mut Vec<u8>, indexed: bool, pal_len: u32, bytes: u32) {
     if indexed {
-        let index = if r.next() % 16 == 0 {
+        let index = if r.next().is_multiple_of(16) {
             r.next() % 400
         } else {
             r.next() % pal_len
@@ -1048,12 +1049,16 @@ fn tga_pixel(r: &mut Random, f: &mut Vec<u8>, indexed: bool, pal_len: u32, bytes
 pub fn make_tga(r: &mut Random, f: &mut Vec<u8>) {
     const PALETTE_BITS: [u32; 5] = [8, 15, 16, 24, 32];
     const BITS: [u32; 4] = [15, 16, 24, 32];
-    let indexed = r.next() % 3 == 0;
-    let rle = r.next() % 2 != 0;
+    let indexed = r.next().is_multiple_of(3);
+    let rle = !r.next().is_multiple_of(2);
     let w = 1 + r.next() % 40;
     let h = 1 + r.next() % 40;
-    let mut desc = if r.next() % 2 != 0 { 0x20u8 } else { 0 };
-    if r.next() % 4 == 0 {
+    let mut desc = if r.next().is_multiple_of(2) {
+        0
+    } else {
+        0x20u8
+    };
+    if r.next().is_multiple_of(4) {
         desc |= 0x10;
     }
     let id_length = r.next() % 3;
@@ -1061,8 +1066,12 @@ pub fn make_tga(r: &mut Random, f: &mut Vec<u8>) {
     let mut pal_len = 0;
     let bytes_per_pixel = if indexed {
         let pal_bits = PALETTE_BITS[(r.next() % 5) as usize];
-        let index_bits = if r.next() % 4 == 0 { 16 } else { 8 };
-        let pal_start = if r.next() % 4 == 0 { r.next() % 3 } else { 0 };
+        let index_bits = if r.next().is_multiple_of(4) { 16 } else { 8 };
+        let pal_start = if r.next().is_multiple_of(4) {
+            r.next() % 3
+        } else {
+            0
+        };
         let entry = if pal_bits == 15 { 2 } else { pal_bits / 8 };
         pal_len = 1 + r.next() % (if index_bits == 8 { 256 } else { 300 });
         f.push(1);
@@ -1081,9 +1090,9 @@ pub fn make_tga(r: &mut Random, f: &mut Vec<u8>) {
         }
         index_bits / 8
     } else {
-        let grey = r.next() % 3 == 0;
+        let grey = r.next().is_multiple_of(3);
         let bits = if grey {
-            if r.next() % 2 != 0 { 16 } else { 8 }
+            if r.next().is_multiple_of(2) { 8 } else { 16 }
         } else {
             BITS[(r.next() % 4) as usize]
         };
@@ -1101,14 +1110,11 @@ pub fn make_tga(r: &mut Random, f: &mut Vec<u8>) {
         for _ in 0..id_length {
             f.push((r.next() >> 7) as u8);
         }
-        (bits + 7) / 8
+        bits.div_ceil(8)
     };
     let mut done = 0;
     while done < w * h {
-        if !rle {
-            tga_pixel(r, f, indexed, pal_len, bytes_per_pixel);
-            done += 1;
-        } else {
+        if rle {
             let count = 1 + r.next() % 128;
             let repeat = r.next() % 2;
             f.push(((repeat << 7) | (count - 1)) as u8);
@@ -1120,40 +1126,60 @@ pub fn make_tga(r: &mut Random, f: &mut Vec<u8>) {
                 }
             }
             done += count;
+        } else {
+            tga_pixel(r, f, indexed, pal_len, bytes_per_pixel);
+            done += 1;
         }
     }
 }
 
 /// A synthetic PSD file: none to five channels, 8 or 16 bits, raw or run-length encoded, with now
 /// and then mode data, resources and reserved bytes to skip.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::many_single_char_names)]
 pub fn make_psd(r: &mut Random, f: &mut Vec<u8>) {
     let channels = r.next() % 6;
     let h = 1 + r.next() % 30;
     let w = 1 + r.next() % 30;
-    let depth = if r.next() % 2 != 0 { 16 } else { 8 };
+    let depth = if r.next().is_multiple_of(2) { 8 } else { 16 };
     let compression = r.next() % 2;
     let pixels = w * h;
     f.extend_from_slice(b"8BPS");
-    p16be(f, if r.next() % 20 == 0 { 2 } else { 1 });
+    p16be(f, if r.next().is_multiple_of(20) { 2 } else { 1 });
     f.extend_from_slice(&[0; 6]);
     p16be(f, channels);
     p32be(f, h);
     p32be(f, w);
     p16be(f, depth);
-    p16be(f, if r.next() % 20 == 0 { 1 } else { 3 });
+    p16be(f, if r.next().is_multiple_of(20) { 1 } else { 3 });
     for _ in 0..3 {
-        let n = if r.next() % 3 == 0 { r.next() % 20 } else { 0 };
+        let n = if r.next().is_multiple_of(3) {
+            r.next() % 20
+        } else {
+            0
+        };
         p32be(f, n);
         for _ in 0..n {
             f.push((r.next() >> 5) as u8);
         }
     }
-    p16be(f, if r.next() % 20 == 0 { 2 } else { compression });
+    p16be(
+        f,
+        if r.next().is_multiple_of(20) {
+            2
+        } else {
+            compression
+        },
+    );
     if compression == 0 {
         for c in 0..channels {
             for _ in 0..pixels {
-                let v = if c == 3 && r.next() % 2 != 0 {
-                    if r.next() % 2 != 0 { 0xffffffff } else { 0 }
+                let v = if c == 3 && !r.next().is_multiple_of(2) {
+                    if r.next().is_multiple_of(2) {
+                        0
+                    } else {
+                        0xffff_ffff
+                    }
                 } else {
                     r.next()
                 };
@@ -1295,16 +1321,18 @@ fn lzw_encode(f: &mut Vec<u8>, px: &[u8], mincs: u32, block_max: u32) {
 /// A synthetic GIF file: one to three frames, each with or without a graphic control extension
 /// (a delay, a transparent colour, a way of disposing of it) and a comment, at a synthetic place,
 /// with a local colour table or the global one, interlaced or not.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 pub fn make_gif(r: &mut Random, f: &mut Vec<u8>) {
     let big_w = 1 + r.next() % 40;
     let big_h = 1 + r.next() % 40;
-    let gct = r.next() % 5 != 0;
+    let gct = !r.next().is_multiple_of(5);
     let gsize = r.next() % 8;
     let frames = 1 + r.next() % 3;
-    f.extend_from_slice(if r.next() % 2 != 0 {
-        b"GIF89a"
-    } else {
+    f.extend_from_slice(if r.next().is_multiple_of(2) {
         b"GIF87a"
+    } else {
+        b"GIF89a"
     });
     p16le(f, big_w);
     p16le(f, big_h);
@@ -1321,7 +1349,7 @@ pub fn make_gif(r: &mut Random, f: &mut Vec<u8>) {
         }
     }
     for _ in 0..frames {
-        if r.next() % 2 != 0 {
+        if !r.next().is_multiple_of(2) {
             let mut eflags = (r.next() % 4) << 2;
             eflags |= r.next() % 2;
             f.extend_from_slice(&[0x21, 0xF9, 4, eflags as u8]);
@@ -1329,7 +1357,7 @@ pub fn make_gif(r: &mut Random, f: &mut Vec<u8>) {
             f.push((r.next() % 256) as u8);
             f.push(0);
         }
-        if r.next() % 5 == 0 {
+        if r.next().is_multiple_of(5) {
             let blocks = r.next() % 3;
             f.extend_from_slice(&[0x21, 0xFE]);
             for _ in 0..blocks {
@@ -1343,23 +1371,23 @@ pub fn make_gif(r: &mut Random, f: &mut Vec<u8>) {
         }
         let x = r.next() % big_w;
         let y = r.next() % big_h;
-        let w = if r.next() % 20 == 0 {
+        let w = if r.next().is_multiple_of(20) {
             0
         } else {
             1 + r.next() % (big_w - x)
         };
         let h = 1 + r.next() % (big_h - y);
         let lct = if gct {
-            r.next() % 3 == 0
+            r.next().is_multiple_of(3)
         } else {
-            r.next() % 10 != 0
+            !r.next().is_multiple_of(10)
         };
         let lsize = r.next() % 8;
         let mut lflags = lsize;
         if lct {
             lflags |= 0x80;
         }
-        if r.next() % 3 == 0 {
+        if r.next().is_multiple_of(3) {
             lflags |= 0x40;
         }
         f.push(0x2C);
@@ -1377,7 +1405,7 @@ pub fn make_gif(r: &mut Random, f: &mut Vec<u8>) {
         if mincs < 2 {
             mincs = 2;
         }
-        if r.next() % 30 == 0 {
+        if r.next().is_multiple_of(30) {
             mincs = r.next() % 14;
         }
         if mincs > 12 {
@@ -1394,20 +1422,20 @@ pub fn make_gif(r: &mut Random, f: &mut Vec<u8>) {
                 (r.next() % colours) as u8
             } else if style == 1 {
                 ((i as u32 / 7) % colours) as u8
-            } else if r.next() % 4 == 0 || i == 0 {
+            } else if r.next().is_multiple_of(4) || i == 0 {
                 (r.next() % colours) as u8
             } else {
                 px[i - 1]
             };
         }
-        let block_max = if r.next() % 4 == 0 {
+        let block_max = if r.next().is_multiple_of(4) {
             1 + r.next() % 254
         } else {
             255
         };
         lzw_encode(f, &px, mincs, block_max);
     }
-    if r.next() % 10 != 0 {
+    if !r.next().is_multiple_of(10) {
         f.push(0x3B);
     }
 }
@@ -1415,7 +1443,7 @@ pub fn make_gif(r: &mut Random, f: &mut Vec<u8>) {
 /// Whitespace between the numbers of a PNM file, now and then with a comment.
 fn pnm_space(r: &mut Random, f: &mut Vec<u8>) {
     const SPACE: [u8; 6] = [b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c];
-    if r.next() % 6 == 0 {
+    if r.next().is_multiple_of(6) {
         f.extend_from_slice(b"\n# made up\n");
     }
     let n = 1 + r.next() % 3;
@@ -1425,6 +1453,8 @@ fn pnm_space(r: &mut Random, f: &mut Vec<u8>) {
 }
 
 /// A synthetic PNM file: grey or colour, binary or text, of every kind of maximum value.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::many_single_char_names)]
 pub fn make_pnm(r: &mut Random, f: &mut Vec<u8>) {
     const KINDS: [u8; 4] = *b"2356";
     let t = KINDS[(r.next() % 4) as usize];
@@ -1433,26 +1463,25 @@ pub fn make_pnm(r: &mut Random, f: &mut Vec<u8>) {
     let w = 1 + r.next() % 40;
     let h = 1 + r.next() % 40;
     let maxv = match r.next() % 8 {
-        0 => 255,
         1 => 1 + r.next() % 255,
         2 => 65535,
         3 => 256 + r.next() % 65280,
         4 => 1 + r.next() % 15,
         5 => {
-            if r.next() % 10 == 0 {
+            if r.next().is_multiple_of(10) {
                 0
             } else {
                 255
             }
         }
         6 => {
-            if r.next() % 10 == 0 {
+            if r.next().is_multiple_of(10) {
                 70000
             } else {
                 1000
             }
         }
-        _ => 255,
+        _ => 255, // 0 and 7
     };
     f.push(b'P');
     f.push(t);
@@ -1466,7 +1495,7 @@ pub fn make_pnm(r: &mut Random, f: &mut Vec<u8>) {
     if ascii {
         for _ in 0..n {
             pnm_space(r, f);
-            let v = if r.next() % 20 == 0 {
+            let v = if r.next().is_multiple_of(20) {
                 r.next() % (maxv + 100)
             } else {
                 r.next() % (maxv + 1)
@@ -1475,7 +1504,11 @@ pub fn make_pnm(r: &mut Random, f: &mut Vec<u8>) {
         }
         f.push(b'\n');
     } else {
-        f.push(if r.next() % 2 != 0 { b'\n' } else { b' ' });
+        f.push(if r.next().is_multiple_of(2) {
+            b' '
+        } else {
+            b'\n'
+        });
         for _ in 0..n {
             let v = r.next();
             if maxv > 255 {
@@ -1491,7 +1524,7 @@ fn hdr_byte(r: &mut Random, k: u32) -> u8 {
     if k < 3 {
         return (r.next() >> 24) as u8;
     }
-    if r.next() % 8 == 0 {
+    if r.next().is_multiple_of(8) {
         0
     } else {
         (120 + r.next() % 20) as u8
@@ -1500,59 +1533,69 @@ fn hdr_byte(r: &mut Random, k: u32) -> u8 {
 
 /// A synthetic Radiance HDR file: a header with lines to skip, then scanlines flat or run-length
 /// encoded.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::many_single_char_names)]
 pub fn make_hdr(r: &mut Random, f: &mut Vec<u8>) {
-    let w = if r.next() % 2 != 0 {
-        1 + r.next() % 40
-    } else {
+    let w = if r.next().is_multiple_of(2) {
         1 + r.next() % 300
+    } else {
+        1 + r.next() % 40
     };
     let h = 1 + r.next() % 20;
-    let rle = r.next() % 4 != 0;
-    f.extend_from_slice(if r.next() % 4 == 0 {
+    let rle = !r.next().is_multiple_of(4);
+    f.extend_from_slice(if r.next().is_multiple_of(4) {
         b"#?RGBE\n"
     } else {
         b"#?RADIANCE\n"
     });
     let lines = r.next() % 3;
     for _ in 0..lines {
-        f.extend_from_slice(if r.next() % 2 != 0 {
-            b"# made up\n"
-        } else {
+        f.extend_from_slice(if r.next().is_multiple_of(2) {
             b"EXPOSURE=1.0\n"
+        } else {
+            b"# made up\n"
         });
     }
-    if r.next() % 30 != 0 {
+    if !r.next().is_multiple_of(30) {
         f.extend_from_slice(b"FORMAT=32-bit_rle_rgbe\n");
     }
-    if r.next() % 4 == 0 {
+    if r.next().is_multiple_of(4) {
         f.extend_from_slice(b"GAMMA=1.0\n");
     }
     f.extend_from_slice(b"\n");
-    f.extend_from_slice(if r.next() % 20 == 0 { b"+Y " } else { b"-Y " });
+    f.extend_from_slice(if r.next().is_multiple_of(20) {
+        b"+Y "
+    } else {
+        b"-Y "
+    });
     f.extend_from_slice(h.to_string().as_bytes());
-    f.extend_from_slice(if r.next() % 5 == 0 { b"  +X " } else { b" +X " });
+    f.extend_from_slice(if r.next().is_multiple_of(5) {
+        b"  +X "
+    } else {
+        b" +X "
+    });
     f.extend_from_slice(w.to_string().as_bytes());
     f.extend_from_slice(b"\n");
     for _ in 0..h {
-        if rle && (8..32768).contains(&w) && r.next() % 20 != 0 {
+        if rle && (8..32768).contains(&w) && !r.next().is_multiple_of(20) {
             f.extend_from_slice(&[2, 2, (w >> 8) as u8, (w & 255) as u8]);
             for k in 0..4 {
                 let mut x = 0;
                 while x < w {
                     let left = w - x;
-                    if r.next() % 2 != 0 {
-                        let n = 1 + r.next() % left.min(127);
-                        f.push((128 + n) as u8);
-                        let value = hdr_byte(r, k);
-                        f.push(value);
-                        x += n;
-                    } else {
+                    if r.next().is_multiple_of(2) {
                         let n = 1 + r.next() % left.min(128);
                         f.push(n as u8);
                         for _ in 0..n {
                             let value = hdr_byte(r, k);
                             f.push(value);
                         }
+                        x += n;
+                    } else {
+                        let n = 1 + r.next() % left.min(127);
+                        f.push((128 + n) as u8);
+                        let value = hdr_byte(r, k);
+                        f.push(value);
                         x += n;
                     }
                 }
@@ -1572,6 +1615,8 @@ pub fn make_hdr(r: &mut Random, f: &mut Vec<u8>) {
 /// of them damaged; each asked its size and whether it is HDR, read at 8 bits a channel, as
 /// floats and every other at 16, with a synthetic gamma and scale; GIFs and every fourth file
 /// also read as an animation.
+// (Written step for step as the C side, `compare/dump_stb_image.c`, has it.)
+#[allow(clippy::too_many_lines)]
 pub fn stb_image_more(seed: u64, count: u32) -> String {
     use stb_image_nrp::{LoadOptions, info, is_16_bit, is_hdr, load, load_16, load_f32, load_gif};
     const GAMMA: [f32; 4] = [2.2, 1.0, 1.8, 2.4];
@@ -1622,7 +1667,7 @@ pub fn stb_image_more(seed: u64, count: u32) -> String {
         kinds[number as usize] += 1;
 
         let req = (r.next() % 5) as i32;
-        let flip = r.next() % 4 == 0;
+        let flip = r.next().is_multiple_of(4);
         let req16 = (r.next() % 5) as i32;
         let reqf = (r.next() % 5) as i32;
         let reqg = (r.next() % 5) as i32;
@@ -1684,7 +1729,7 @@ pub fn stb_image_more(seed: u64, count: u32) -> String {
                         }
                     }
                     Err(error) => {
-                        hash.add(&0xffffffffu32.to_le_bytes());
+                        hash.add(&0xffff_ffff_u32.to_le_bytes());
                         hash.add(error.reason().as_bytes());
                         hash.add(&[0]);
                     }
@@ -1693,7 +1738,7 @@ pub fn stb_image_more(seed: u64, count: u32) -> String {
         }
 
         if (i + 1) % 200 == 0 || i + 1 == count {
-            out += &format!("stb_image_more {} {:016x}\n", i + 1, hash.value);
+            writeln!(out, "stb_image_more {} {:016x}", i + 1, hash.value).unwrap();
         }
     }
     out + &format!(

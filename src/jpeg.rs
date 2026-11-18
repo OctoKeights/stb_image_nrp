@@ -2,7 +2,7 @@
 //! original's plain C kernels (its `STBI_NO_SIMD` build).
 
 use super::{
-    Context, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, Scan, addints_valid, compute_y,
+    Context, Failed, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, Scan, addints_valid, compute_y,
     mad2sizes_valid, mad3sizes_valid, mul2shorts_valid,
 };
 
@@ -149,7 +149,9 @@ impl Jpeg {
 }
 
 /// `stbi__build_huffman`
-fn build_huffman(s: &mut Context, h: &mut Huffman, count: &[i32; 16]) -> bool {
+// (The names are stb_image's, so that the code reads against the original.)
+#[allow(clippy::many_single_char_names)]
+fn build_huffman(s: &mut Context, h: &mut Huffman, count: &[i32; 16]) -> Result<(), Failed> {
     let mut k = 0usize;
     // build size list for each symbol (from JPEG spec)
     for (i, &n) in count.iter().enumerate() {
@@ -157,7 +159,7 @@ fn build_huffman(s: &mut Context, h: &mut Huffman, count: &[i32; 16]) -> bool {
             h.size[k] = (i + 1) as u8;
             k += 1;
             if k >= 257 {
-                return s.err("bad size list");
+                return s.fail("bad size list");
             }
         }
     }
@@ -176,14 +178,14 @@ fn build_huffman(s: &mut Context, h: &mut Huffman, count: &[i32; 16]) -> bool {
                 code += 1;
             }
             if code > 1u32 << j {
-                return s.err("bad code lengths");
+                return s.fail("bad code lengths");
             }
         }
         // compute largest code + 1 for this size, preshifted as needed later
         h.maxcode[j] = code << (16 - j);
         code <<= 1;
     }
-    h.maxcode[17] = 0xffffffff;
+    h.maxcode[17] = 0xffff_ffff;
 
     // build non-spec acceleration table; 255 is flag for not-accelerated
     h.fast.fill(255);
@@ -197,7 +199,7 @@ fn build_huffman(s: &mut Context, h: &mut Huffman, count: &[i32; 16]) -> bool {
             }
         }
     }
-    true
+    Ok(())
 }
 
 /// `stbi__build_fast_ac`: build a table that decodes both magnitude and value of small ACs in
@@ -257,6 +259,8 @@ static STBI_BMASK: [u32; 17] = [
 ];
 
 /// `stbi__jpeg_huff_decode`: decode a jpeg huffman value from the bitstream
+// (The names are stb_image's, so that the code reads against the original.)
+#[allow(clippy::many_single_char_names)]
 fn jpeg_huff_decode(j: &mut Entropy, s: &mut Context, h: &Huffman) -> i32 {
     if j.code_bits < 16 {
         grow_buffer_unsafe(j, s);
@@ -363,7 +367,7 @@ fn jpeg_get_bit(j: &mut Entropy, s: &mut Context) -> bool {
     let k = j.code_buffer;
     j.code_buffer <<= 1;
     j.code_bits -= 1;
-    k & 0x80000000 != 0
+    k & 0x8000_0000 != 0
 }
 
 // given a value that's at position X in the zigzag stream,
@@ -392,13 +396,15 @@ struct BlockTables<'a> {
 }
 
 /// `stbi__jpeg_decode_block`: decode one 64-entry block--
+// (The names are stb_image's, so that the code reads against the original.)
+#[allow(clippy::many_single_char_names)]
 fn jpeg_decode_block(
     j: &mut Entropy,
     s: &mut Context,
     data: &mut [i16; 64],
     tables: &BlockTables,
     dc_pred: &mut i32,
-) -> bool {
+) -> Result<(), Failed> {
     let BlockTables {
         hdc,
         hac,
@@ -410,7 +416,7 @@ fn jpeg_decode_block(
     }
     let t = jpeg_huff_decode(j, s, hdc);
     if !(0..=15).contains(&t) {
-        return s.err("bad huffman code");
+        return s.fail("bad huffman code");
     }
 
     // 0 all the ac values now so we can do it 32-bits at a time
@@ -418,12 +424,12 @@ fn jpeg_decode_block(
 
     let diff = if t != 0 { extend_receive(j, s, t) } else { 0 };
     if !addints_valid(*dc_pred, diff) {
-        return s.err("bad delta");
+        return s.fail("bad delta");
     }
     let dc = *dc_pred + diff;
     *dc_pred = dc;
     if !mul2shorts_valid(dc, i32::from(dequant[0])) {
-        return s.err("can't merge dc and ac");
+        return s.fail("can't merge dc and ac");
     }
     data[0] = (dc * i32::from(dequant[0])) as i16;
 
@@ -440,7 +446,7 @@ fn jpeg_decode_block(
             k += ((r >> 4) & 15) as usize; // run
             let sz = r & 15; // combined length
             if sz > j.code_bits {
-                return s.err("bad huffman code");
+                return s.fail("bad huffman code");
             }
             j.code_buffer <<= sz;
             j.code_bits -= sz;
@@ -451,7 +457,7 @@ fn jpeg_decode_block(
         } else {
             let rs = jpeg_huff_decode(j, s, hac);
             if rs < 0 {
-                return s.err("bad huffman code");
+                return s.fail("bad huffman code");
             }
             let sz = rs & 15;
             let r = rs >> 4;
@@ -472,7 +478,7 @@ fn jpeg_decode_block(
             break;
         }
     }
-    true
+    Ok(())
 }
 
 /// `stbi__jpeg_decode_block_prog_dc`
@@ -482,9 +488,9 @@ fn jpeg_decode_block_prog_dc(
     data: &mut [i16],
     hdc: &Huffman,
     dc_pred: &mut i32,
-) -> bool {
+) -> Result<(), Failed> {
     if j.spec_end != 0 {
-        return s.err("can't merge dc and ac");
+        return s.fail("can't merge dc and ac");
     }
 
     if j.code_bits < 16 {
@@ -495,17 +501,17 @@ fn jpeg_decode_block_prog_dc(
         // first scan for DC coefficient, must be first
         let t = jpeg_huff_decode(j, s, hdc);
         if !(0..=15).contains(&t) {
-            return s.err("can't merge dc and ac");
+            return s.fail("can't merge dc and ac");
         }
         let diff = if t != 0 { extend_receive(j, s, t) } else { 0 };
 
         if !addints_valid(*dc_pred, diff) {
-            return s.err("bad delta");
+            return s.fail("bad delta");
         }
         let dc = *dc_pred + diff;
         *dc_pred = dc;
         if !mul2shorts_valid(dc, 1 << j.succ_low) {
-            return s.err("can't merge dc and ac");
+            return s.fail("can't merge dc and ac");
         }
         data[0] = (dc * (1 << j.succ_low)) as i16;
     } else {
@@ -514,21 +520,24 @@ fn jpeg_decode_block_prog_dc(
             data[0] = data[0].wrapping_add((1i32 << j.succ_low) as i16);
         }
     }
-    true
+    Ok(())
 }
 
 /// `stbi__jpeg_decode_block_prog_ac`
 // @OPTIMIZE: store non-zigzagged during the decode passes,
 // and only de-zigzag when dequantizing
+// (One pass, step for step as stb_image's, its state shared throughout; the names are stb_image's,
+// so that the code reads against the original.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 fn jpeg_decode_block_prog_ac(
     j: &mut Entropy,
     s: &mut Context,
     data: &mut [i16],
     hac: &Huffman,
     fac: &[i16; 1 << FAST_BITS],
-) -> bool {
+) -> Result<(), Failed> {
     if j.spec_start == 0 {
-        return s.err("can't merge dc and ac");
+        return s.fail("can't merge dc and ac");
     }
 
     if j.succ_high == 0 {
@@ -536,7 +545,7 @@ fn jpeg_decode_block_prog_ac(
 
         if j.eob_run != 0 {
             j.eob_run -= 1;
-            return true;
+            return Ok(());
         }
 
         let mut k = j.spec_start;
@@ -551,7 +560,7 @@ fn jpeg_decode_block_prog_ac(
                 k += (r >> 4) & 15; // run
                 let sz = r & 15; // combined length
                 if sz > j.code_bits {
-                    return s.err("bad huffman code");
+                    return s.fail("bad huffman code");
                 }
                 j.code_buffer <<= sz;
                 j.code_bits -= sz;
@@ -561,7 +570,7 @@ fn jpeg_decode_block_prog_ac(
             } else {
                 let rs = jpeg_huff_decode(j, s, hac);
                 if rs < 0 {
-                    return s.err("bad huffman code");
+                    return s.fail("bad huffman code");
                 }
                 let sz = rs & 15;
                 let r = rs >> 4;
@@ -609,7 +618,7 @@ fn jpeg_decode_block_prog_ac(
                 // @OPTIMIZE see if we can use the fast path here, advance-by-r is so slow, eh
                 let rs = jpeg_huff_decode(j, s, hac);
                 if rs < 0 {
-                    return s.err("bad huffman code");
+                    return s.fail("bad huffman code");
                 }
                 let mut sz = rs & 15;
                 let mut r = rs >> 4;
@@ -627,7 +636,7 @@ fn jpeg_decode_block_prog_ac(
                     }
                 } else {
                     if sz != 1 {
-                        return s.err("bad huffman code");
+                        return s.fail("bad huffman code");
                     }
                     // sign bit
                     if jpeg_get_bit(j, s) {
@@ -663,10 +672,10 @@ fn jpeg_decode_block_prog_ac(
             }
         }
     }
-    true
+    Ok(())
 }
 
-/// `stbi__clamp`: take a -128..127 value and stbi__clamp it and convert to 0..255
+/// `stbi__clamp`: take a -128..127 value and `stbi__clamp` it and convert to 0..255
 fn clamp(x: i32) -> u8 {
     // trick to use a single test to catch both cases
     if x as u32 > 255 {
@@ -690,23 +699,23 @@ fn fsh(x: i32) -> i32 {
     x.wrapping_mul(4096)
 }
 
-/// `STBI__IDCT_1D`: derived from jidctint -- DCT_ISLOW. Gives (x0, x1, x2, x3, t0, t1, t2,
+/// `STBI__IDCT_1D`: derived from jidctint -- `DCT_ISLOW`. Gives (x0, x1, x2, x3, t0, t1, t2,
 /// t3). (The sums wrap where the original's overflow, which only values no encoder writes
 /// bring about.)
 #[allow(clippy::excessive_precision)]
 fn idct_1d([s0, s1, s2, s3, s4, s5, s6, s7]: [i32; 8]) -> [i32; 8] {
-    const C0_5411961: i32 = f2f(0.5411961);
-    const CN1_847759065: i32 = f2f(-1.847759065);
-    const C0_765366865: i32 = f2f(0.765366865);
-    const C1_175875602: i32 = f2f(1.175875602);
-    const C0_298631336: i32 = f2f(0.298631336);
-    const C2_053119869: i32 = f2f(2.053119869);
-    const C3_072711026: i32 = f2f(3.072711026);
-    const C1_501321110: i32 = f2f(1.501321110);
-    const CN0_899976223: i32 = f2f(-0.899976223);
-    const CN2_562915447: i32 = f2f(-2.562915447);
-    const CN1_961570560: i32 = f2f(-1.961570560);
-    const CN0_390180644: i32 = f2f(-0.390180644);
+    const C0_5411961: i32 = f2f(0.541_196_1);
+    const CN1_847759065: i32 = f2f(-1.847_759_065);
+    const C0_765366865: i32 = f2f(0.765_366_865);
+    const C1_175875602: i32 = f2f(1.175_875_602);
+    const C0_298631336: i32 = f2f(0.298_631_336);
+    const C2_053119869: i32 = f2f(2.053_119_869);
+    const C3_072711026: i32 = f2f(3.072_711_026);
+    const C1_501321110: i32 = f2f(1.501_321_110);
+    const CN0_899976223: i32 = f2f(-0.899_976_223);
+    const CN2_562915447: i32 = f2f(-2.562_915_447);
+    const CN1_961570560: i32 = f2f(-1.961_570_560);
+    const CN0_390180644: i32 = f2f(-0.390_180_644);
     let add = i32::wrapping_add;
     let sub = i32::wrapping_sub;
     let mul = i32::wrapping_mul;
@@ -843,7 +852,7 @@ fn is_restart(x: u8) -> bool {
     (0xd0..=0xd7).contains(&x)
 }
 
-/// `stbi__jpeg_reset`: after a restart interval, stbi__jpeg_reset the entropy decoder and the
+/// `stbi__jpeg_reset`: after a restart interval, `stbi__jpeg_reset` the entropy decoder and the
 /// dc prediction
 fn jpeg_reset(j: &mut Jpeg) {
     j.e.code_bits = 0;
@@ -856,7 +865,7 @@ fn jpeg_reset(j: &mut Jpeg) {
     j.todo = if j.restart_interval != 0 {
         j.restart_interval
     } else {
-        0x7fffffff
+        0x7fff_ffff
     };
     j.e.eob_run = 0;
     // no more than 1<<31 MCUs if no restart_interal? that's plenty safe,
@@ -882,7 +891,10 @@ fn count_down(z: &mut Jpeg, s: &mut Context) -> bool {
 }
 
 /// `stbi__parse_entropy_coded_data`
-fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
+// (One pass, step for step as stb_image's, its state shared throughout; the names are stb_image's,
+// so that the code reads against the original.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> Result<(), Failed> {
     jpeg_reset(z);
     if !z.progressive {
         if z.scan_n == 1 {
@@ -898,7 +910,7 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                 for i in 0..w {
                     let comp = &mut z.img_comp[n];
                     let ha = comp.ha as usize;
-                    if !jpeg_decode_block(
+                    if jpeg_decode_block(
                         &mut z.e,
                         s,
                         &mut data,
@@ -909,8 +921,10 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                             dequant: &z.dequant[comp.tq as usize],
                         },
                         &mut comp.dc_pred,
-                    ) {
-                        return false;
+                    )
+                    .is_err()
+                    {
+                        return Err(Failed);
                     }
                     let w2 = comp.w2 as usize;
                     idct_block(
@@ -920,11 +934,11 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                     );
                     // every data block is an MCU, so countdown the restart interval
                     if count_down(z, s) {
-                        return true;
+                        return Ok(());
                     }
                 }
             }
-            true
+            Ok(())
         } else {
             // interleaved
             let mut data = [0i16; 64];
@@ -941,7 +955,7 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                                 let x2 = ((i * comp.h + x) * 8) as usize;
                                 let y2 = ((j * comp.v + y) * 8) as usize;
                                 let ha = comp.ha as usize;
-                                if !jpeg_decode_block(
+                                if jpeg_decode_block(
                                     &mut z.e,
                                     s,
                                     &mut data,
@@ -952,8 +966,10 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                                         dequant: &z.dequant[comp.tq as usize],
                                     },
                                     &mut comp.dc_pred,
-                                ) {
-                                    return false;
+                                )
+                                .is_err()
+                                {
+                                    return Err(Failed);
                                 }
                                 let w2 = comp.w2 as usize;
                                 idct_block(&mut comp.data[w2 * y2 + x2..], w2, &data);
@@ -963,11 +979,11 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                     // after all interleaved components, that's an interleaved MCU,
                     // so now count down the restart interval
                     if count_down(z, s) {
-                        return true;
+                        return Ok(());
                     }
                 }
             }
-            true
+            Ok(())
         }
     } else if z.scan_n == 1 {
         let n = z.order[0] as usize;
@@ -986,35 +1002,31 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                 // progressive coeffs got initialized at setup so this is fine
                 if !z.e.nomore {
                     if z.e.spec_start == 0 {
-                        if !jpeg_decode_block_prog_dc(
+                        jpeg_decode_block_prog_dc(
                             &mut z.e,
                             s,
                             data,
                             &z.huff_dc[comp.hd as usize],
                             &mut comp.dc_pred,
-                        ) {
-                            return false;
-                        }
+                        )?;
                     } else {
                         let ha = comp.ha as usize;
-                        if !jpeg_decode_block_prog_ac(
+                        jpeg_decode_block_prog_ac(
                             &mut z.e,
                             s,
                             data,
                             &z.huff_ac[ha],
                             &z.fast_ac[ha],
-                        ) {
-                            return false;
-                        }
+                        )?;
                     }
                 }
                 // every data block is an MCU, so countdown the restart interval
                 if count_down(z, s) {
-                    return true;
+                    return Ok(());
                 }
             }
         }
-        true
+        Ok(())
     } else {
         // interleaved
         for j in 0..z.img_mcu_y {
@@ -1031,26 +1043,24 @@ fn parse_entropy_coded_data(z: &mut Jpeg, s: &mut Context) -> bool {
                             let y2 = j * comp.v + y;
                             let at = 64 * (x2 + y2 * comp.coeff_w) as usize;
                             let data = &mut comp.coeff[at..at + 64];
-                            if !jpeg_decode_block_prog_dc(
+                            jpeg_decode_block_prog_dc(
                                 &mut z.e,
                                 s,
                                 data,
                                 &z.huff_dc[comp.hd as usize],
                                 &mut comp.dc_pred,
-                            ) {
-                                return false;
-                            }
+                            )?;
                         }
                     }
                 }
                 // after all interleaved components, that's an interleaved MCU,
                 // so now count down the restart interval
                 if count_down(z, s) {
-                    return true;
+                    return Ok(());
                 }
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -1088,17 +1098,20 @@ fn jpeg_finish(z: &mut Jpeg, s: &Context) {
 }
 
 /// `stbi__process_marker`
-fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
+// (One pass, step for step as stb_image's, its state shared throughout; the names are stb_image's,
+// so that the code reads against the original.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> Result<(), Failed> {
     match m {
-        STBI_MARKER_NONE => return s.err("expected marker"), // no marker found
+        STBI_MARKER_NONE => return s.fail("expected marker"), // no marker found
 
         0xDD => {
             // DRI - specify restart interval
             if s.get16be() != 4 {
-                return s.err("bad DRI len");
+                return s.fail("bad DRI len");
             }
             z.restart_interval = s.get16be();
-            return true;
+            return Ok(());
         }
 
         0xDB => {
@@ -1110,10 +1123,10 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
                 let sixteen = p != 0;
                 let t = (q & 15) as usize;
                 if p != 0 && p != 1 {
-                    return s.err("bad DQT type");
+                    return s.fail("bad DQT type");
                 }
                 if t > 3 {
-                    return s.err("bad DQT table");
+                    return s.fail("bad DQT table");
                 }
 
                 for &at in &STBI_JPEG_DEZIGZAG[..64] {
@@ -1125,7 +1138,7 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
                 }
                 l -= if sixteen { 129 } else { 65 };
             }
-            return l == 0;
+            return if l == 0 { Ok(()) } else { Err(Failed) };
         }
 
         0xC4 => {
@@ -1138,7 +1151,7 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
                 let tc = q >> 4;
                 let th = (q & 15) as usize;
                 if tc > 1 || th > 3 {
-                    return s.err("bad DHT header");
+                    return s.fail("bad DHT header");
                 }
                 for size in &mut sizes {
                     *size = i32::from(s.get8());
@@ -1146,7 +1159,7 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
                 }
                 if n > 256 {
                     // Loop over i < n would write past end of values!
-                    return s.err("bad DHT header");
+                    return s.fail("bad DHT header");
                 }
                 l -= 17;
                 let table = if tc == 0 {
@@ -1154,9 +1167,7 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
                 } else {
                     &mut z.huff_ac[th]
                 };
-                if !build_huffman(s, table, &sizes) {
-                    return false;
-                }
+                build_huffman(s, table, &sizes)?;
                 for value in &mut table.values[..n as usize] {
                     *value = s.get8();
                 }
@@ -1165,7 +1176,7 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
                 }
                 l -= n;
             }
-            return l == 0;
+            return if l == 0 { Ok(()) } else { Err(Failed) };
         }
         _ => {}
     }
@@ -1175,10 +1186,9 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
         let mut l = s.get16be();
         if l < 2 {
             if m == 0xFE {
-                return s.err("bad COM len");
-            } else {
-                return s.err("bad APP len");
+                return s.fail("bad COM len");
             }
+            return s.fail("bad APP len");
         }
         l -= 2;
 
@@ -1215,21 +1225,21 @@ fn process_marker(z: &mut Jpeg, s: &mut Context, m: u8) -> bool {
         }
 
         s.skip(l);
-        return true;
+        return Ok(());
     }
 
-    s.err("unknown marker")
+    s.fail("unknown marker")
 }
 
 /// `stbi__process_scan_header`: after we see SOS
-fn process_scan_header(z: &mut Jpeg, s: &mut Context) -> bool {
+fn process_scan_header(z: &mut Jpeg, s: &mut Context) -> Result<(), Failed> {
     let ls = s.get16be();
     z.scan_n = i32::from(s.get8());
     if z.scan_n < 1 || z.scan_n > 4 || z.scan_n > s.img_n {
-        return s.err("bad SOS component count");
+        return s.fail("bad SOS component count");
     }
     if ls != 6 + 2 * z.scan_n {
-        return s.err("bad SOS len");
+        return s.fail("bad SOS len");
     }
     for i in 0..z.scan_n as usize {
         let id = i32::from(s.get8());
@@ -1242,15 +1252,15 @@ fn process_scan_header(z: &mut Jpeg, s: &mut Context) -> bool {
             which += 1;
         }
         if which == s.img_n as usize {
-            return false; // no match
+            return Err(Failed); // no match
         }
         z.img_comp[which].hd = q >> 4;
         if z.img_comp[which].hd > 3 {
-            return s.err("bad DC huff");
+            return s.fail("bad DC huff");
         }
         z.img_comp[which].ha = q & 15;
         if z.img_comp[which].ha > 3 {
-            return s.err("bad AC huff");
+            return s.fail("bad AC huff");
         }
         z.order[i] = which as i32;
     }
@@ -1268,50 +1278,53 @@ fn process_scan_header(z: &mut Jpeg, s: &mut Context) -> bool {
                 || z.e.succ_high > 13
                 || z.e.succ_low > 13
             {
-                return s.err("bad SOS");
+                return s.fail("bad SOS");
             }
         } else {
             if z.e.spec_start != 0 {
-                return s.err("bad SOS");
+                return s.fail("bad SOS");
             }
             if z.e.succ_high != 0 || z.e.succ_low != 0 {
-                return s.err("bad SOS");
+                return s.fail("bad SOS");
             }
             z.e.spec_end = 63;
         }
     }
 
-    true
+    Ok(())
 }
 
 /// `stbi__process_frame_header`
-fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
+// (One pass, step for step as stb_image's, its state shared throughout; the names are stb_image's,
+// so that the code reads against the original.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> Result<(), Failed> {
     let (mut h_max, mut v_max) = (1, 1);
     let lf = s.get16be();
     if lf < 11 {
-        return s.err("bad SOF len"); // JPEG
+        return s.fail("bad SOF len"); // JPEG
     }
     let p = s.get8();
     if p != 8 {
-        return s.err("only 8-bit"); // JPEG baseline
+        return s.fail("only 8-bit"); // JPEG baseline
     }
     s.img_y = s.get16be() as u32;
     if s.img_y == 0 {
-        return s.err("no header height"); // Legal, but we don't handle it--but neither does IJG
+        return s.fail("no header height"); // Legal, but we don't handle it--but neither does IJG
     }
     s.img_x = s.get16be() as u32;
     if s.img_x == 0 {
-        return s.err("0 width"); // JPEG requires
+        return s.fail("0 width"); // JPEG requires
     }
     if s.img_y > STBI_MAX_DIMENSIONS {
-        return s.err("too large");
+        return s.fail("too large");
     }
     if s.img_x > STBI_MAX_DIMENSIONS {
-        return s.err("too large");
+        return s.fail("too large");
     }
     let c = i32::from(s.get8());
     if c != 3 && c != 1 && c != 4 {
-        return s.err("bad component count");
+        return s.fail("bad component count");
     }
     s.img_n = c;
     for comp in z.img_comp.iter_mut().take(c as usize) {
@@ -1320,7 +1333,7 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
     }
 
     if lf != 8 + 3 * s.img_n {
-        return s.err("bad SOF len");
+        return s.fail("bad SOF len");
     }
 
     z.rgb = 0;
@@ -1333,24 +1346,24 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
         let q = i32::from(s.get8());
         comp.h = q >> 4;
         if comp.h == 0 || comp.h > 4 {
-            return s.err("bad H");
+            return s.fail("bad H");
         }
         comp.v = q & 15;
         if comp.v == 0 || comp.v > 4 {
-            return s.err("bad V");
+            return s.fail("bad V");
         }
         comp.tq = i32::from(s.get8());
         if comp.tq > 3 {
-            return s.err("bad TQ");
+            return s.fail("bad TQ");
         }
     }
 
     if scan != Scan::Load {
-        return true;
+        return Ok(());
     }
 
     if !mad3sizes_valid(s.img_x as i32, s.img_y as i32, s.img_n, 0) {
-        return s.err("too large");
+        return s.fail("too large");
     }
 
     for comp in &z.img_comp[..s.img_n as usize] {
@@ -1363,10 +1376,10 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
     // and I've never seen a non-corrupted JPEG file actually use them
     for comp in &z.img_comp[..s.img_n as usize] {
         if h_max % comp.h != 0 {
-            return s.err("bad H");
+            return s.fail("bad H");
         }
         if v_max % comp.v != 0 {
-            return s.err("bad V");
+            return s.fail("bad V");
         }
     }
 
@@ -1397,7 +1410,7 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
         comp.linebuf = Vec::new();
         // (The original has no memory for a size that does not fit an int.)
         if !mad2sizes_valid(comp.w2, comp.h2, 15) {
-            return s.err("outofmem");
+            return s.fail("outofmem");
         }
         // (What the original leaves as it finds it, and the port has as zeros.)
         comp.data = vec![0; comp.w2 as usize * comp.h2 as usize];
@@ -1407,14 +1420,14 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
             // (The original checks that twice the size, for values of two bytes, fits an
             // int, and has no memory when it does not.)
             if !mad3sizes_valid(comp.w2, comp.h2, 2, 15) {
-                return s.err("outofmem");
+                return s.fail("outofmem");
             }
             // 0 all the coeffs now so they're guaranteed to be initialized
             comp.coeff = vec![0; comp.w2 as usize * comp.h2 as usize];
         }
     }
 
-    true
+    Ok(())
 }
 
 // use comparisons since in some cases we handle more than one case (e.g. SOF)
@@ -1438,27 +1451,25 @@ fn is_sof_progressive(x: u8) -> bool {
 }
 
 /// `stbi__decode_jpeg_header`
-fn decode_jpeg_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> bool {
+fn decode_jpeg_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> Result<(), Failed> {
     z.jfif = false;
     z.app14_color_transform = -1; // valid values are 0,1,2
     z.e.marker = STBI_MARKER_NONE; // initialize cached marker to empty
     let mut m = get_marker(&mut z.e, s);
     if !is_soi(m) {
-        return s.err("no SOI");
+        return s.fail("no SOI");
     }
     if scan == Scan::Type {
-        return true;
+        return Ok(());
     }
     m = get_marker(&mut z.e, s);
     while !is_sof(m) {
-        if !process_marker(z, s, m) {
-            return false;
-        }
+        process_marker(z, s, m)?;
         m = get_marker(&mut z.e, s);
         while m == STBI_MARKER_NONE {
             // some files have extra padding after their blocks, so ok, we'll scan
             if s.at_eof() {
-                return s.err("no SOF");
+                return s.fail("no SOF");
             }
             m = get_marker(&mut z.e, s);
         }
@@ -1493,24 +1504,18 @@ fn skip_jpeg_junk_at_end(s: &mut Context) -> u8 {
 }
 
 /// `stbi__decode_jpeg_image`: decode image to YCbCr format
-fn decode_jpeg_image(j: &mut Jpeg, s: &mut Context) -> bool {
+fn decode_jpeg_image(j: &mut Jpeg, s: &mut Context) -> Result<(), Failed> {
     for comp in &mut j.img_comp {
         comp.data = Vec::new();
         comp.coeff = Vec::new();
     }
     j.restart_interval = 0;
-    if !decode_jpeg_header(j, s, Scan::Load) {
-        return false;
-    }
+    decode_jpeg_header(j, s, Scan::Load)?;
     let mut m = get_marker(&mut j.e, s);
     while !is_eoi(m) {
         if is_sos(m) {
-            if !process_scan_header(j, s) {
-                return false;
-            }
-            if !parse_entropy_coded_data(j, s) {
-                return false;
-            }
+            process_scan_header(j, s)?;
+            parse_entropy_coded_data(j, s)?;
             if j.e.marker == STBI_MARKER_NONE {
                 j.e.marker = skip_jpeg_junk_at_end(s);
                 // if we reach eof without hitting a marker, stbi__get_marker()
@@ -1524,23 +1529,21 @@ fn decode_jpeg_image(j: &mut Jpeg, s: &mut Context) -> bool {
             let ld = s.get16be();
             let nl = s.get16be() as u32;
             if ld != 4 {
-                return s.err("bad DNL len");
+                return s.fail("bad DNL len");
             }
             if nl != s.img_y {
-                return s.err("bad DNL height");
+                return s.fail("bad DNL height");
             }
             m = get_marker(&mut j.e, s);
         } else {
-            if !process_marker(j, s, m) {
-                return false;
-            }
+            process_marker(j, s, m)?;
             m = get_marker(&mut j.e, s);
         }
     }
     if j.progressive {
         jpeg_finish(j, s);
     }
-    true
+    Ok(())
 }
 
 // static jfif-centered resampling (across block boundaries)
@@ -1634,7 +1637,7 @@ fn ycbcr_to_rgb_row(out: &mut [u8], y: &[u8], pcb: &[u8], pcr: &[u8], count: usi
         let r = y_fixed + cr * float2fixed(1.40200);
         let g = y_fixed
             + (cr * -float2fixed(0.71414))
-            + ((cb * -float2fixed(0.34414)) & 0xffff0000u32 as i32);
+            + ((cb * -float2fixed(0.34414)) & 0xffff_0000_u32 as i32);
         let b = y_fixed + cb * float2fixed(1.77200);
         [r, g, b].map(|v| (v >> 20).clamp(0, 255) as u8)
     };
@@ -1684,6 +1687,9 @@ fn blinn_8x8(x: u8, y: u8) -> u8 {
 }
 
 /// `load_jpeg_image`: the pixels and how many channels the file has.
+// (One pass, step for step as stb_image's, its state shared throughout; the names are stb_image's,
+// so that the code reads against the original.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 fn load_jpeg_image(z: &mut Jpeg, s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)> {
     s.img_n = 0; // make stbi__cleanup_jpeg safe
 
@@ -1693,7 +1699,7 @@ fn load_jpeg_image(z: &mut Jpeg, s: &mut Context, req_comp: i32) -> Option<(Vec<
     }
 
     // load a jpeg image from whichever source, but leave in YCbCr format
-    if !decode_jpeg_image(z, s) {
+    if decode_jpeg_image(z, s).is_err() {
         return None;
     }
 
@@ -1771,7 +1777,7 @@ fn load_jpeg_image(z: &mut Jpeg, s: &mut Context, req_comp: i32) -> Option<(Vec<
                 Resample::H2 => resample_row_h_2(&mut comp.linebuf, in_near, w),
                 Resample::Hv2 => resample_row_hv_2(&mut comp.linebuf, in_near, in_far, w),
                 Resample::Generic => {
-                    resample_row_generic(&mut comp.linebuf, in_near, w, r.hs as usize)
+                    resample_row_generic(&mut comp.linebuf, in_near, w, r.hs as usize);
                 }
             }
             r.ystep += 1;
@@ -1889,7 +1895,7 @@ pub(crate) fn jpeg_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)
 /// `stbi__jpeg_test`
 pub(crate) fn jpeg_test(s: &mut Context) -> bool {
     let mut j = Jpeg::new();
-    let r = decode_jpeg_header(&mut j, s, Scan::Type);
+    let r = decode_jpeg_header(&mut j, s, Scan::Type).is_ok();
     s.rewind();
     r
 }
@@ -1898,7 +1904,7 @@ pub(crate) fn jpeg_test(s: &mut Context) -> bool {
 pub(crate) fn jpeg_info(s: &mut Context) -> Option<RawInfo> {
     let mut j = Jpeg::new();
     // stbi__jpeg_info_raw
-    if !decode_jpeg_header(&mut j, s, Scan::Header) {
+    if decode_jpeg_header(&mut j, s, Scan::Header).is_err() {
         s.rewind();
         return None;
     }

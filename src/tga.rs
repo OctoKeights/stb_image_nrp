@@ -5,7 +5,7 @@ use super::{
     vertical_flip,
 };
 
-/// `stbi__tga_get_comp`: returns STBI_rgb or whatever, 0 on error; with it, whether the pixels
+/// `stbi__tga_get_comp`: returns `STBI_rgb` or whatever, 0 on error; with it, whether the pixels
 /// are 15 or 16 bits of RGB.
 fn tga_get_comp(bits_per_pixel: i32, is_grey: bool) -> (i32, bool) {
     // only RGB or RGBA (incl. 16bit) or grey allowed
@@ -126,6 +126,8 @@ fn tga_read_rgb16(s: &mut Context, out: &mut [u8]) {
 }
 
 /// `stbi__tga_load`: the pixels and the channels in the file; the size goes into the context.
+// (One pass, step for step as stb_image's, its state shared throughout.)
+#[allow(clippy::too_many_lines)]
 pub(crate) fn tga_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)> {
     // read in the TGA header
     let tga_offset = i32::from(s.get8());
@@ -183,7 +185,7 @@ pub(crate) fn tga_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
 
     if !tga_indexed && !tga_is_rle && !tga_rgb16 {
         for row in tga_data.chunks_exact_mut(width * comp) {
-            if !s.getn_into(row) {
+            if s.getn_into(row).is_err() {
                 return s.errp("premature EOF");
             }
         }
@@ -203,7 +205,7 @@ pub(crate) fn tga_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
                 for entry in tga_palette.chunks_exact_mut(comp) {
                     tga_read_rgb16(s, entry);
                 }
-            } else if !s.getn_into(&mut tga_palette) {
+            } else if s.getn_into(&mut tga_palette).is_err() {
                 return s.errp("bad palette");
             }
         }

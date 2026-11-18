@@ -63,6 +63,7 @@ pub enum Channels {
 
 impl Channels {
     /// The channels for a count of 1 to 4.
+    #[must_use]
     pub const fn from_count(count: u8) -> Option<Channels> {
         match count {
             1 => Some(Channels::Grey),
@@ -74,6 +75,7 @@ impl Channels {
     }
 
     /// The number of channels.
+    #[must_use]
     pub const fn count(self) -> usize {
         self as usize
     }
@@ -105,6 +107,7 @@ impl LoadError {
     }
 
     /// The original's short description of the failure, such as `"bad zlib header"`.
+    #[must_use]
     pub fn reason(&self) -> &'static str {
         self.reason
     }
@@ -199,6 +202,7 @@ pub enum ImageFormat {
 
 impl ImageFormat {
     /// The original's number for the format: `STBI_type_jpeg` and the rest, from 1.
+    #[must_use]
     pub fn code(self) -> i32 {
         self as i32 + 1
     }
@@ -261,6 +265,12 @@ pub(crate) enum Scan {
     Header,
 }
 
+/// A step of decoding that failed. Its reason is on the [`Context`] (or the zlib decoder's
+/// buffer), where `stbi__err` records it, since the last reason recorded is the one given,
+/// as in the original, even when a caller tries something else after the failure.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Failed;
+
 /// `stbi__context`: the file's bytes and how far into them the reader is, with what the
 /// readers share. (Also the failure reason and the settings, which are globals in the
 /// original.)
@@ -291,10 +301,15 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// `stbi__err`
-    pub fn err(&mut self, reason: &'static str) -> bool {
+    /// `stbi__err`, for a step that fails: records `reason` as the failure's.
+    pub fn fail<T>(&mut self, reason: &'static str) -> Result<T, Failed> {
+        self.set_reason(reason);
+        Err(Failed)
+    }
+
+    /// `stbi__err` where the caller reports the failure itself: records `reason`.
+    pub fn set_reason(&mut self, reason: &'static str) {
         self.reason = reason;
-        false
     }
 
     /// `stbi__errpuc`
@@ -335,17 +350,17 @@ impl<'a> Context<'a> {
     }
 
     /// `stbi__getn`, the bytes added to `into`.
-    pub fn getn(&mut self, into: &mut Vec<u8>, n: i32) -> bool {
+    pub fn getn(&mut self, into: &mut Vec<u8>, n: i32) -> Result<(), Failed> {
         if n <= 0 {
-            return true;
+            return Ok(());
         }
         let n = n as usize;
         if self.pos <= self.buffer.len() && n <= self.buffer.len() - self.pos {
             into.extend_from_slice(&self.buffer[self.pos..self.pos + n]);
             self.pos += n;
-            true
+            Ok(())
         } else {
-            false
+            Err(Failed)
         }
     }
 
@@ -368,17 +383,17 @@ impl<'a> Context<'a> {
     }
 
     /// `stbi__getn` into the whole of `into`.
-    pub fn getn_into(&mut self, into: &mut [u8]) -> bool {
+    pub fn getn_into(&mut self, into: &mut [u8]) -> Result<(), Failed> {
         if into.is_empty() {
-            return true;
+            return Ok(());
         }
         let n = into.len();
         if self.pos <= self.buffer.len() && n <= self.buffer.len() - self.pos {
             into.copy_from_slice(&self.buffer[self.pos..self.pos + n]);
             self.pos += n;
-            true
+            Ok(())
         } else {
-            false
+            Err(Failed)
         }
     }
 
@@ -536,13 +551,13 @@ pub(crate) fn convert_format<T: Sample>(
         match (img_n, req_comp) {
             (1, 2) => pixels.for_each(|(src, dest)| dest.copy_from_slice(&[src[0], T::FULL])),
             (1, 3) => {
-                pixels.for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[0], src[0]]))
+                pixels.for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[0], src[0]]));
             }
             (1, 4) => pixels
                 .for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[0], src[0], T::FULL])),
             (2, 1) => pixels.for_each(|(src, dest)| dest[0] = src[0]),
             (2, 3) => {
-                pixels.for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[0], src[0]]))
+                pixels.for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[0], src[0]]));
             }
             (2, 4) => pixels
                 .for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[0], src[0], src[1]])),
@@ -550,14 +565,14 @@ pub(crate) fn convert_format<T: Sample>(
                 .for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[1], src[2], T::FULL])),
             (3, 1) => pixels.for_each(|(src, dest)| dest[0] = T::compute_y(src[0], src[1], src[2])),
             (3, 2) => pixels.for_each(|(src, dest)| {
-                dest.copy_from_slice(&[T::compute_y(src[0], src[1], src[2]), T::FULL])
+                dest.copy_from_slice(&[T::compute_y(src[0], src[1], src[2]), T::FULL]);
             }),
             (4, 1) => pixels.for_each(|(src, dest)| dest[0] = T::compute_y(src[0], src[1], src[2])),
             (4, 2) => pixels.for_each(|(src, dest)| {
-                dest.copy_from_slice(&[T::compute_y(src[0], src[1], src[2]), src[3]])
+                dest.copy_from_slice(&[T::compute_y(src[0], src[1], src[2]), src[3]]);
             }),
             (4, 3) => {
-                pixels.for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[1], src[2]]))
+                pixels.for_each(|(src, dest)| dest.copy_from_slice(&[src[0], src[1], src[2]]));
             }
             _ => return s.errp("unsupported"),
         }
@@ -605,7 +620,7 @@ fn load_main(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixels, i32)> 
         let options = s.options;
         return hdr::hdr_to_ldr(
             s,
-            hdr,
+            &hdr,
             x,
             y,
             if req_comp != 0 { req_comp } else { comp },
@@ -625,7 +640,7 @@ fn load_main(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixels, i32)> 
 /// `stbi__convert_16_to_8`
 fn convert_16_to_8(
     s: &mut Context,
-    orig: Vec<u16>,
+    orig: &[u16],
     w: i32,
     h: i32,
     channels: i32,
@@ -647,7 +662,7 @@ fn convert_16_to_8(
 /// `stbi__convert_8_to_16`
 fn convert_8_to_16(
     s: &mut Context,
-    orig: Vec<u8>,
+    orig: &[u8],
     w: i32,
     h: i32,
     channels: i32,
@@ -684,6 +699,11 @@ pub(crate) fn vertical_flip<T>(image: &mut [T], w: usize, h: usize, per_pixel: u
 /// `channels` is the channels each pixel is to have, or `None` for the file's. A file of 16
 /// bits a channel is brought down to 8, and an HDR file's floats with
 /// [`LoadOptions::hdr_to_ldr_gamma`]. Of a GIF, the first frame.
+///
+/// # Errors
+///
+/// A file in none of the formats read, or one that is corrupt or too large, with `stb_image`'s
+/// reason for the failure.
 pub fn load(
     file: &[u8],
     channels: Option<Channels>,
@@ -722,7 +742,7 @@ fn load_and_postprocess_8bit(s: &mut Context, desired_channels: i32) -> Option<I
 
     let mut result = match result {
         Pixels::U8(result) => result,
-        Pixels::U16(result) => convert_16_to_8(s, result, x, y, channels)?,
+        Pixels::U16(result) => convert_16_to_8(s, &result, x, y, channels)?,
     };
 
     if options.flip_vertically {
@@ -736,6 +756,10 @@ fn load_and_postprocess_8bit(s: &mut Context, desired_channels: i32) -> Option<I
 ///
 /// A file of 8 bits a channel is brought up to 16, each value repeated as its low byte, and
 /// an HDR file's floats as [`load`] brings them to 8 bits.
+///
+/// # Errors
+///
+/// As [`load`].
 pub fn load_16(
     file: &[u8],
     channels: Option<Channels>,
@@ -756,7 +780,7 @@ pub fn load_16(
 
     let mut result = match result {
         Pixels::U16(result) => result,
-        Pixels::U8(result) => match convert_8_to_16(&mut s, result, x, y, count) {
+        Pixels::U8(result) => match convert_8_to_16(&mut s, &result, x, y, count) {
             Some(result) => result,
             None => return Err(LoadError::new(s.reason)),
         },
@@ -774,6 +798,10 @@ pub fn load_16(
 /// An HDR file's values come as they are. Any other file's come by way of 8 bits a channel,
 /// made floats with [`LoadOptions::ldr_to_hdr_gamma`] and [`LoadOptions::ldr_to_hdr_scale`]
 /// (alpha linearly, from 0 to 1).
+///
+/// # Errors
+///
+/// As [`load`].
 pub fn load_f32(
     file: &[u8],
     channels: Option<Channels>,
@@ -801,7 +829,7 @@ pub fn load_f32(
     if let Some(loaded) = load_and_postprocess_8bit(&mut s, desired_channels) {
         let (x, y) = (loaded.width as i32, loaded.height as i32);
         let count = loaded.channels as i32;
-        return match hdr::ldr_to_hdr(&mut s, loaded.data, x, y, count, options) {
+        return match hdr::ldr_to_hdr(&mut s, &loaded.data, x, y, count, options) {
             Some(data) => Ok(Image {
                 width: loaded.width,
                 height: loaded.height,
@@ -816,6 +844,10 @@ pub fn load_f32(
 }
 
 /// Reads every frame of a GIF file, each with its delay (`stbi_load_gif_from_memory`).
+///
+/// # Errors
+///
+/// A file that is not a GIF, or one that is corrupt or too large, with `stb_image`'s reason.
 pub fn load_gif(
     file: &[u8],
     channels: Option<Channels>,
@@ -826,12 +858,17 @@ pub fn load_gif(
 }
 
 /// Whether a file is a Radiance `.hdr` file (`stbi_is_hdr_from_memory`).
+#[must_use]
 pub fn is_hdr(file: &[u8]) -> bool {
     hdr::hdr_test(&mut Context::new(file, &LoadOptions::default()))
 }
 
 /// The format, size and channels of the image in a file, without its pixels
 /// (`stbi_info_from_memory`, with `stbi_is_16_bit_from_memory`).
+///
+/// # Errors
+///
+/// A file in none of the formats read, or whose header is corrupt, with `stb_image`'s reason.
 pub fn info(file: &[u8]) -> Result<Info, LoadError> {
     raw_info(file).map(Info::from)
 }
@@ -868,6 +905,7 @@ fn raw_info(buffer: &[u8]) -> Result<RawInfo, LoadError> {
 }
 
 /// Whether the image in a file has 16 bits a channel (`stbi_is_16_bit_from_memory`).
+#[must_use]
 pub fn is_16_bit(file: &[u8]) -> bool {
     raw_info(file).is_ok_and(|info| info.is_16_bit)
 }
@@ -913,7 +951,7 @@ mod tests {
             mul2shorts_valid(16384, -2)
                 && !mul2shorts_valid(16385, -2)
                 && mul2shorts_valid(-2, 16384)
-                && mul2shorts_valid(123456, 0)
+                && mul2shorts_valid(123_456, 0)
                 && mul2shorts_valid(5, -1)
         );
     }

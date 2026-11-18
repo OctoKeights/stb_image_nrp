@@ -2,7 +2,7 @@
 //! between floats and 8 bits a channel, `stbi__hdr_to_ldr` and `stbi__ldr_to_hdr`.
 
 use super::{
-    Context, ImageFormat, LoadOptions, RawInfo, STBI_MAX_DIMENSIONS, mad3sizes_valid,
+    Context, Failed, ImageFormat, LoadOptions, RawInfo, STBI_MAX_DIMENSIONS, mad3sizes_valid,
     mad4sizes_valid,
 };
 
@@ -157,7 +157,7 @@ fn hdr_load_pixels(
     req_comp: i32,
     mut isrle: bool,
     scanline: &mut [u8],
-) -> bool {
+) -> Result<(), Failed> {
     let explut = hdr_makelut(req_comp);
     let (w, n) = (width as usize, req_comp as usize);
 
@@ -180,7 +180,7 @@ fn hdr_load_pixels(
             continue;
         }
         if ((i32::from(rgbe[2]) << 8) | i32::from(rgbe[3])) != width {
-            return s.err("invalid decoded scanline length");
+            return s.fail("invalid decoded scanline length");
         }
 
         for k in 0..4 {
@@ -192,7 +192,7 @@ fn hdr_load_pixels(
                     let value = s.get8();
                     count -= 128;
                     if count == 0 || width - x < i32::from(count) {
-                        return s.err("corrupt");
+                        return s.fail("corrupt");
                     }
                     for _ in 0..count {
                         scanline[x as usize * 4 + k] = value;
@@ -201,7 +201,7 @@ fn hdr_load_pixels(
                 } else {
                     // Dump
                     if count == 0 || width - x < i32::from(count) {
-                        return s.err("corrupt");
+                        return s.fail("corrupt");
                     }
                     for _ in 0..count {
                         scanline[x as usize * 4 + k] = s.get8();
@@ -221,7 +221,7 @@ fn hdr_load_pixels(
         }
     }
 
-    true
+    Ok(())
 }
 
 /// `stbi__hdr_load`: the floats, and the channels in the file (always 3); the size goes into
@@ -285,7 +285,7 @@ pub(crate) fn hdr_load(s: &mut Context, mut req_comp: i32) -> Option<(Vec<f32>, 
     let isrle = (8..32768).contains(&width);
     let mut scanline = vec![0u8; if isrle { width as usize * 4 } else { 0 }];
 
-    if !hdr_load_pixels(
+    if hdr_load_pixels(
         s,
         &mut hdr_data,
         width,
@@ -293,7 +293,9 @@ pub(crate) fn hdr_load(s: &mut Context, mut req_comp: i32) -> Option<(Vec<f32>, 
         req_comp,
         isrle,
         &mut scanline,
-    ) {
+    )
+    .is_err()
+    {
         return None;
     }
 
@@ -340,9 +342,11 @@ pub(crate) fn hdr_info(s: &mut Context) -> Option<RawInfo> {
 
 /// `stbi__hdr_to_ldr`: floats to 8 bits a channel, by [`LoadOptions::hdr_to_ldr_gamma`] and
 /// [`LoadOptions::hdr_to_ldr_scale`]; alpha in a straight line.
+// (The names are stb_image's, so that the code reads against the original.)
+#[allow(clippy::many_single_char_names)]
 pub(crate) fn hdr_to_ldr(
     s: &mut Context,
-    data: Vec<f32>,
+    data: &[f32],
     x: i32,
     y: i32,
     comp: i32,
@@ -388,7 +392,7 @@ fn float_to_u8(mut z: f32) -> u8 {
 /// [`LoadOptions::ldr_to_hdr_scale`]; alpha in a straight line.
 pub(crate) fn ldr_to_hdr(
     s: &mut Context,
-    data: Vec<u8>,
+    data: &[u8],
     x: i32,
     y: i32,
     comp: i32,

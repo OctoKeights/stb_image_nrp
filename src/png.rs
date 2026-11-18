@@ -7,8 +7,8 @@
 //!   - avoids explicit window management
 
 use super::{
-    Context, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, Sample, Scan, convert_format,
-    mad2sizes_valid, mad3sizes_valid, zlib,
+    Context, Failed, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, Sample, Scan,
+    convert_format, mad2sizes_valid, mad3sizes_valid, zlib,
 };
 
 /// `stbi__pngchunk`
@@ -25,14 +25,14 @@ fn get_chunk_header(s: &mut Context) -> PngChunk {
 }
 
 /// `stbi__check_png_header`
-fn check_png_header(s: &mut Context) -> bool {
+fn check_png_header(s: &mut Context) -> Result<(), Failed> {
     static PNG_SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
     for byte in PNG_SIG {
         if s.get8() != byte {
-            return s.err("bad png sig");
+            return s.fail("bad png sig");
         }
     }
-    true
+    Ok(())
 }
 
 /// `stbi__png`
@@ -76,7 +76,7 @@ fn paeth(a: i32, b: i32, c: i32) -> i32 {
 static STBI_DEPTH_SCALE_TABLE: [u8; 9] = [0, 0xff, 0x55, 0, 0x11, 0, 0, 0, 0x01];
 
 /// `stbi__create_png_alpha_expand8`: adds an extra all-255 alpha channel, in place (the
-/// values are at the front of `dest`). img_n must be 1 or 3.
+/// values are at the front of `dest`). `img_n` must be 1 or 3.
 fn create_png_alpha_expand8(dest: &mut [u8], x: usize, img_n: i32) {
     // must process data backwards since we allow dest==src
     if img_n == 1 {
@@ -85,7 +85,7 @@ fn create_png_alpha_expand8(dest: &mut [u8], x: usize, img_n: i32) {
             dest[i * 2] = dest[i];
         }
     } else {
-        debug_assert!(img_n == 3);
+        debug_assert_eq!(img_n, 3);
         for i in (0..x).rev() {
             dest[i * 4 + 3] = 255;
             dest[i * 4 + 2] = dest[i * 3 + 2];
@@ -96,6 +96,8 @@ fn create_png_alpha_expand8(dest: &mut [u8], x: usize, img_n: i32) {
 }
 
 /// `stbi__create_png_image_raw`: create the png data from post-deflated data
+// (One pass, step for step as stb_image's, its state shared throughout.)
+#[allow(clippy::too_many_lines)]
 fn create_png_image_raw(
     s: &mut Context,
     a: &mut Png,
@@ -103,7 +105,7 @@ fn create_png_image_raw(
     out_n: i32,
     (x, y): (u32, u32),
     (depth, color): (i32, i32),
-) -> bool {
+) -> Result<(), Failed> {
     let bytes = if depth == 16 { 2 } else { 1 };
     let img_n = s.img_n; // copy it into a local for later
     let output_bytes = out_n * bytes;
@@ -112,15 +114,15 @@ fn create_png_image_raw(
 
     debug_assert!(out_n == s.img_n || out_n == s.img_n + 1);
     if !mad3sizes_valid(x as i32, y as i32, output_bytes, 0) {
-        return s.err("outofmem");
+        return s.fail("outofmem");
     }
 
     if !mad3sizes_valid(img_n, x as i32, depth, 7) {
-        return s.err("too large");
+        return s.fail("too large");
     }
     let img_width_bytes = ((img_n as u32 * x * depth as u32) + 7) >> 3;
     if !mad2sizes_valid(img_width_bytes as i32, y as i32, img_width_bytes as i32) {
-        return s.err("too large");
+        return s.fail("too large");
     }
     let img_len = (img_width_bytes + 1) * y;
 
@@ -128,7 +130,7 @@ fn create_png_image_raw(
     // but issue #276 reported a PNG in the wild that had extra data at the end (all zeros),
     // so just check for raw_len < img_len always.
     if (raw.len() as u64) < u64::from(img_len) {
-        return s.err("not enough pixels");
+        return s.fail("not enough pixels");
     }
 
     // (The original makes room for the pixels before these checks; nothing is seen of it
@@ -173,7 +175,8 @@ fn create_png_image_raw(
 
         // check filter type
         if filter > 4 {
-            all_ok = s.err("invalid filter");
+            s.set_reason("invalid filter");
+            all_ok = false;
             break;
         }
 
@@ -253,7 +256,7 @@ fn create_png_image_raw(
                 }
             } else if depth == 2 {
                 for (i, dest) in dest[..nsmp].iter_mut().enumerate() {
-                    if i & 3 == 0 {
+                    if i % 4 == 0 {
                         inb = cur[input];
                         input += 1;
                     }
@@ -261,9 +264,9 @@ fn create_png_image_raw(
                     inb <<= 2;
                 }
             } else {
-                debug_assert!(depth == 1);
+                debug_assert_eq!(depth, 1);
                 for (i, dest) in dest[..nsmp].iter_mut().enumerate() {
-                    if i & 7 == 0 {
+                    if i % 8 == 0 {
                         inb = cur[input];
                         input += 1;
                     }
@@ -291,7 +294,7 @@ fn create_png_image_raw(
                     *dest = value(i);
                 }
             } else {
-                debug_assert!(img_n + 1 == out_n);
+                debug_assert_eq!(img_n + 1, out_n);
                 for (i, dest) in dest16.chunks_exact_mut(out_n_).enumerate() {
                     for (c, dest) in dest[..img_n_].iter_mut().enumerate() {
                         *dest = value(i * img_n_ + c);
@@ -303,14 +306,14 @@ fn create_png_image_raw(
     }
 
     if !all_ok {
-        return false;
+        return Err(Failed);
     }
     a.out = if depth == 16 {
         Pixels::U16(out16)
     } else {
         Pixels::U8(out8)
     };
-    true
+    Ok(())
 }
 
 /// Where a pass of an interlaced image goes in the whole: its size, its first pixel's place,
@@ -353,7 +356,7 @@ fn create_png_image(
     depth: i32,
     color: i32,
     interlaced: bool,
-) -> bool {
+) -> Result<(), Failed> {
     let bytes = if depth == 16 { 2 } else { 1 };
     let out_bytes = out_n * bytes;
     if !interlaced {
@@ -362,7 +365,7 @@ fn create_png_image(
 
     // de-interlacing
     if !mad3sizes_valid(s.img_x as i32, s.img_y as i32, out_bytes, 0) {
-        return s.err("outofmem");
+        return s.fail("outofmem");
     }
     let (img_x, img_y, out_n_) = (s.img_x as usize, s.img_y as usize, out_n as usize);
     let mut whole = if depth == 16 {
@@ -381,9 +384,7 @@ fn create_png_image(
         let y = (s.img_y.wrapping_sub(yorig[p]).wrapping_add(yspc[p] - 1)) / yspc[p];
         if x != 0 && y != 0 {
             let img_len = ((((s.img_n as u32 * x * depth as u32) + 7) >> 3) + 1) * y;
-            if !create_png_image_raw(s, a, image_data, out_n, (x, y), (depth, color)) {
-                return false;
-            }
+            create_png_image_raw(s, a, image_data, out_n, (x, y), (depth, color))?;
             let place = Placement {
                 x: x as usize,
                 y: y as usize,
@@ -395,7 +396,7 @@ fn create_png_image(
             match (&mut whole, &a.out) {
                 (Pixels::U8(whole), Pixels::U8(pass)) => spread(whole, pass, img_x, out_n_, &place),
                 (Pixels::U16(whole), Pixels::U16(pass)) => {
-                    spread(whole, pass, img_x, out_n_, &place)
+                    spread(whole, pass, img_x, out_n_, &place);
                 }
                 _ => unreachable!(),
             }
@@ -404,7 +405,7 @@ fn create_png_image(
     }
     a.out = whole;
 
-    true
+    Ok(())
 }
 
 /// `stbi__compute_transparency`, `stbi__compute_transparency16`: compute color-based
@@ -426,14 +427,19 @@ fn compute_transparency<T: Sample>(p: &mut [T], tc: [T; 3], out_n: i32) {
 }
 
 /// `stbi__expand_png_palette`
-fn expand_png_palette(s: &mut Context, a: &mut Png, palette: &[u8; 1024], pal_img_n: i32) -> bool {
+fn expand_png_palette(
+    s: &mut Context,
+    a: &mut Png,
+    palette: &[u8; 1024],
+    pal_img_n: i32,
+) -> Result<(), Failed> {
     let pixel_count = s.img_x.wrapping_mul(s.img_y);
     let Pixels::U8(orig) = &a.out else {
         unreachable!()
     };
 
     if !mad2sizes_valid(pixel_count as i32, pal_img_n, 0) {
-        return s.err("outofmem");
+        return s.fail("outofmem");
     }
     let pixel_count = pixel_count as usize;
     let mut p = Vec::with_capacity(pixel_count * pal_img_n as usize);
@@ -451,7 +457,7 @@ fn expand_png_palette(s: &mut Context, a: &mut Png, palette: &[u8; 1024], pal_im
     }
     a.out = Pixels::U8(p);
 
-    true
+    Ok(())
 }
 
 /// `stbi__de_iphone`
@@ -478,7 +484,7 @@ fn de_iphone_bytes(s: &Context, p: &mut [u8], pixel_count: usize) {
             p.swap(0, 2);
         }
     } else {
-        debug_assert!(s.img_out_n == 4);
+        debug_assert_eq!(s.img_out_n, 4);
         if s.options.unpremultiply {
             // convert bgr to rgb and unpremultiply
             for p in p[..pixel_count * 4].as_chunks_mut::<4>().0.iter_mut() {
@@ -504,19 +510,21 @@ fn de_iphone_bytes(s: &Context, p: &mut [u8], pixel_count: usize) {
 }
 
 /// `STBI__PNG_TYPE`
-const fn png_type(name: &[u8; 4]) -> u32 {
-    ((name[0] as u32) << 24) + ((name[1] as u32) << 16) + ((name[2] as u32) << 8) + name[3] as u32
+const fn png_type(name: [u8; 4]) -> u32 {
+    u32::from_be_bytes(name)
 }
 
-const CGBI: u32 = png_type(b"CgBI");
-const IHDR: u32 = png_type(b"IHDR");
-const PLTE: u32 = png_type(b"PLTE");
-const TRNS: u32 = png_type(b"tRNS");
-const IDAT: u32 = png_type(b"IDAT");
-const IEND: u32 = png_type(b"IEND");
+const CGBI: u32 = png_type(*b"CgBI");
+const IHDR: u32 = png_type(*b"IHDR");
+const PLTE: u32 = png_type(*b"PLTE");
+const TRNS: u32 = png_type(*b"tRNS");
+const IDAT: u32 = png_type(*b"IDAT");
+const IEND: u32 = png_type(*b"IEND");
 
 /// `stbi__parse_png_file`
-fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bool {
+// (One pass, step for step as stb_image's, its state shared throughout.)
+#[allow(clippy::too_many_lines)]
+fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> Result<(), Failed> {
     let mut palette = [0u8; 1024];
     let mut pal_img_n = 0u8;
     let mut has_trans = false;
@@ -534,12 +542,10 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
     z.out = Pixels::U8(Vec::new());
     z.is_iphone = false;
 
-    if !check_png_header(s) {
-        return false;
-    }
+    check_png_header(s)?;
 
     if scan == Scan::Type {
-        return true;
+        return Ok(());
     }
 
     loop {
@@ -551,66 +557,65 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
             }
             IHDR => {
                 if !first {
-                    return s.err("multiple IHDR");
+                    return s.fail("multiple IHDR");
                 }
                 first = false;
                 if c.length != 13 {
-                    return s.err("bad IHDR len");
+                    return s.fail("bad IHDR len");
                 }
                 s.img_x = s.get32be();
                 s.img_y = s.get32be();
                 if s.img_y > STBI_MAX_DIMENSIONS {
-                    return s.err("too large");
+                    return s.fail("too large");
                 }
                 if s.img_x > STBI_MAX_DIMENSIONS {
-                    return s.err("too large");
+                    return s.fail("too large");
                 }
                 z.depth = i32::from(s.get8());
                 if z.depth != 1 && z.depth != 2 && z.depth != 4 && z.depth != 8 && z.depth != 16 {
-                    return s.err("1/2/4/8/16-bit only");
+                    return s.fail("1/2/4/8/16-bit only");
                 }
                 color = i32::from(s.get8());
                 if color > 6 {
-                    return s.err("bad ctype");
+                    return s.fail("bad ctype");
                 }
                 if color == 3 && z.depth == 16 {
-                    return s.err("bad ctype");
+                    return s.fail("bad ctype");
                 }
                 if color == 3 {
                     pal_img_n = 3;
                 } else if color & 1 != 0 {
-                    return s.err("bad ctype");
+                    return s.fail("bad ctype");
                 }
                 if z.depth < 8 && color != 0 && color != 3 {
-                    return s.err("bad ctype");
+                    return s.fail("bad ctype");
                 }
                 let comp = s.get8();
                 if comp != 0 {
-                    return s.err("bad comp method");
+                    return s.fail("bad comp method");
                 }
                 let filter = s.get8();
                 if filter != 0 {
-                    return s.err("bad filter method");
+                    return s.fail("bad filter method");
                 }
                 interlace = s.get8();
                 if interlace > 1 {
-                    return s.err("bad interlace method");
+                    return s.fail("bad interlace method");
                 }
                 if s.img_x == 0 || s.img_y == 0 {
-                    return s.err("0-pixel image");
+                    return s.fail("0-pixel image");
                 }
                 if pal_img_n == 0 {
-                    s.img_n =
-                        (if color & 2 != 0 { 3 } else { 1 }) + (if color & 4 != 0 { 1 } else { 0 });
+                    s.img_n = (if color & 2 != 0 { 3 } else { 1 }) + i32::from(color & 4 != 0);
                     if (1 << 30) / s.img_x / (s.img_n as u32) < s.img_y {
-                        return s.err("too large");
+                        return s.fail("too large");
                     }
                 } else {
                     // if paletted, then pal_n is our final components, and
                     // img_n is # components to decompress/filter.
                     s.img_n = 1;
                     if (1 << 30) / s.img_x / 4 < s.img_y {
-                        return s.err("too large");
+                        return s.fail("too large");
                     }
                     palette = [0; 1024];
                 }
@@ -618,14 +623,14 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
             }
             PLTE => {
                 if first {
-                    return s.err("first not IHDR");
+                    return s.fail("first not IHDR");
                 }
                 if c.length > 256 * 3 {
-                    return s.err("invalid PLTE");
+                    return s.fail("invalid PLTE");
                 }
                 pal_len = c.length / 3;
                 if pal_len * 3 != c.length {
-                    return s.err("invalid PLTE");
+                    return s.fail("invalid PLTE");
                 }
                 for i in 0..pal_len as usize {
                     palette[i * 4] = s.get8();
@@ -636,21 +641,21 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
             }
             TRNS => {
                 if first {
-                    return s.err("first not IHDR");
+                    return s.fail("first not IHDR");
                 }
                 if z.has_idata {
-                    return s.err("tRNS after IDAT");
+                    return s.fail("tRNS after IDAT");
                 }
                 if pal_img_n != 0 {
                     if scan == Scan::Header {
                         s.img_n = 4;
-                        return true;
+                        return Ok(());
                     }
                     if pal_len == 0 {
-                        return s.err("tRNS before PLTE");
+                        return s.fail("tRNS before PLTE");
                     }
                     if c.length > pal_len {
-                        return s.err("bad tRNS len");
+                        return s.fail("bad tRNS len");
                     }
                     pal_img_n = 4;
                     for i in 0..c.length as usize {
@@ -658,16 +663,16 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
                     }
                 } else {
                     if s.img_n & 1 == 0 {
-                        return s.err("tRNS with alpha");
+                        return s.fail("tRNS with alpha");
                     }
                     if c.length != s.img_n as u32 * 2 {
-                        return s.err("bad tRNS len");
+                        return s.fail("bad tRNS len");
                     }
                     has_trans = true;
                     // non-paletted with tRNS = constant alpha. if header-scanning, we can stop now.
                     if scan == Scan::Header {
                         s.img_n += 1;
-                        return true;
+                        return Ok(());
                     }
                     if z.depth == 16 {
                         for tc16 in tc16.iter_mut().take(s.img_n as usize) {
@@ -684,23 +689,23 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
             }
             IDAT => {
                 if first {
-                    return s.err("first not IHDR");
+                    return s.fail("first not IHDR");
                 }
                 if pal_img_n != 0 && pal_len == 0 {
-                    return s.err("no PLTE");
+                    return s.fail("no PLTE");
                 }
                 if scan == Scan::Header {
                     // header scan definitely stops at first IDAT
                     if pal_img_n != 0 {
                         s.img_n = i32::from(pal_img_n);
                     }
-                    return true;
+                    return Ok(());
                 }
                 if c.length > (1 << 30) {
-                    return s.err("IDAT size limit");
+                    return s.fail("IDAT size limit");
                 }
                 if !super::addsizes_valid(ioff as i32, c.length as i32) {
-                    return false;
+                    return Err(Failed);
                 }
                 if ioff + c.length > idata_limit {
                     if idata_limit == 0 {
@@ -708,7 +713,7 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
                     }
                     while ioff + c.length > idata_limit {
                         if idata_limit > i32::MAX as u32 / 2 {
-                            return s.err("IDAT size limit");
+                            return s.fail("IDAT size limit");
                         }
                         idata_limit *= 2;
                     }
@@ -716,20 +721,20 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
                     // of no bytes leaves it null.)
                     z.has_idata = true;
                 }
-                if !s.getn(&mut z.idata, c.length as i32) {
-                    return s.err("outofdata");
+                if s.getn(&mut z.idata, c.length as i32).is_err() {
+                    return s.fail("outofdata");
                 }
                 ioff += c.length;
             }
             IEND => {
                 if first {
-                    return s.err("first not IHDR");
+                    return s.fail("first not IHDR");
                 }
                 if scan != Scan::Load {
-                    return true;
+                    return Ok(());
                 }
                 if !z.has_idata {
-                    return s.err("no IDAT");
+                    return s.fail("no IDAT");
                 }
                 // initial guess for decoded data size to avoid unnecessary reallocs
                 let bpl = (s.img_x * z.depth as u32).div_ceil(8); // bytes per line, per component
@@ -741,7 +746,7 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
                         if let Some(reason) = reason {
                             s.reason = reason;
                         }
-                        return false;
+                        return Err(Failed);
                     }
                 };
                 z.idata = Vec::new();
@@ -750,9 +755,7 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
                 } else {
                     s.img_out_n = s.img_n;
                 }
-                if !create_png_image(s, z, &expanded, s.img_out_n, z.depth, color, interlace != 0) {
-                    return false;
-                }
+                create_png_image(s, z, &expanded, s.img_out_n, z.depth, color, interlace != 0)?;
                 if has_trans {
                     match &mut z.out {
                         Pixels::U16(out) => compute_transparency(out, tc16, s.img_out_n),
@@ -769,24 +772,22 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> bo
                     if req_comp >= 3 {
                         s.img_out_n = req_comp;
                     }
-                    if !expand_png_palette(s, z, &palette, s.img_out_n) {
-                        return false;
-                    }
+                    expand_png_palette(s, z, &palette, s.img_out_n)?;
                 } else if has_trans {
                     // non-paletted image with tRNS -> source image has (constant) alpha
                     s.img_n += 1;
                 }
                 // end of PNG chunk, read and skip CRC
                 s.get32be();
-                return true;
+                return Ok(());
             }
             _ => {
                 // if critical, fail
                 if first {
-                    return s.err("first not IHDR");
+                    return s.fail("first not IHDR");
                 }
                 if c.kind & (1 << 29) == 0 {
-                    return s.err("PNG chunk not known");
+                    return s.fail("PNG chunk not known");
                 }
                 s.skip(c.length as i32);
             }
@@ -808,7 +809,7 @@ pub(crate) fn png_load(s: &mut Context, req_comp: i32) -> Option<(Pixels, i32)> 
     if !(0..=4).contains(&req_comp) {
         return s.errp("bad req_comp");
     }
-    if !parse_png_file(s, &mut p, Scan::Load, req_comp) {
+    if parse_png_file(s, &mut p, Scan::Load, req_comp).is_err() {
         return None;
     }
     let mut result = p.out;
@@ -838,7 +839,7 @@ pub(crate) fn png_load(s: &mut Context, req_comp: i32) -> Option<(Pixels, i32)> 
 
 /// `stbi__png_test`
 pub(crate) fn png_test(s: &mut Context) -> bool {
-    let r = check_png_header(s);
+    let r = check_png_header(s).is_ok();
     s.rewind();
     r
 }
@@ -852,7 +853,7 @@ pub(crate) fn png_info(s: &mut Context) -> Option<RawInfo> {
         depth: 0,
         is_iphone: false,
     };
-    if !parse_png_file(s, &mut p, Scan::Header, 0) {
+    if parse_png_file(s, &mut p, Scan::Header, 0).is_err() {
         s.rewind();
         return None;
     }
@@ -874,10 +875,10 @@ mod tests {
     use miniz_nrp::{self as miniz, Level, crc32};
     use stb_image_write_nrp::{Channels, Image, PngFilter, WriteOptions, write_png};
 
-    fn chunk(file: &mut Vec<u8>, name: &[u8; 4], bytes: &[u8]) {
+    fn chunk(file: &mut Vec<u8>, name: [u8; 4], bytes: &[u8]) {
         file.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         let from = file.len();
-        file.extend_from_slice(name);
+        file.extend_from_slice(&name);
         file.extend_from_slice(bytes);
         let crc = crc32(&file[from..]);
         file.extend_from_slice(&crc.to_be_bytes());
@@ -898,16 +899,16 @@ mod tests {
         header.extend_from_slice(&x.to_be_bytes());
         header.extend_from_slice(&y.to_be_bytes());
         header.extend_from_slice(&[depth, color, 0, 0, interlace]);
-        chunk(&mut file, b"IHDR", &header);
+        chunk(&mut file, *b"IHDR", &header);
         for (name, bytes) in more {
-            chunk(&mut file, name, bytes);
+            chunk(&mut file, **name, bytes);
         }
         chunk(
             &mut file,
-            b"IDAT",
+            *b"IDAT",
             &miniz::compress(rows, Level::new(6).unwrap()),
         );
-        chunk(&mut file, b"IEND", &[]);
+        chunk(&mut file, *b"IEND", &[]);
         file
     }
 
@@ -1190,14 +1191,18 @@ mod tests {
         // Blue first, deflate with no zlib header, and a chunk that says so in front.
         let rows = [0, 30, 20, 10, 128];
         let mut file = vec![137, 80, 78, 71, 13, 10, 26, 10];
-        chunk(&mut file, b"CgBI", &[0, 0, 0, 0]);
-        chunk(&mut file, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0]);
+        chunk(&mut file, *b"CgBI", &[0, 0, 0, 0]);
         chunk(
             &mut file,
-            b"IDAT",
+            *b"IHDR",
+            &[0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0],
+        );
+        chunk(
+            &mut file,
+            *b"IDAT",
             &miniz::compress(&rows, Level::new(6).unwrap())[2..],
         );
-        chunk(&mut file, b"IEND", &[]);
+        chunk(&mut file, *b"IEND", &[]);
         let options = LoadOptions::default();
         assert!(info(&file).unwrap().is_iphone_png);
         assert_eq!(
@@ -1302,11 +1307,11 @@ mod tests {
         );
         // No pixels at all, and pixels that are no zlib stream.
         let mut file = good[..33].to_vec();
-        chunk(&mut file, b"IEND", &[]);
+        chunk(&mut file, *b"IEND", &[]);
         assert_eq!(refused(&file), "no IDAT");
         let mut file = good[..33].to_vec();
-        chunk(&mut file, b"IDAT", &[1, 2, 3, 4]);
-        chunk(&mut file, b"IEND", &[]);
+        chunk(&mut file, *b"IDAT", &[1, 2, 3, 4]);
+        chunk(&mut file, *b"IEND", &[]);
         assert_eq!(refused(&file), "bad zlib header");
     }
 }

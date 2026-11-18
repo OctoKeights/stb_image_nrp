@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1
+
+- **Stricter lints, enforced in CI.** `Cargo.toml` turns on clippy's pedantic group for every
+  target, and forbids `unsafe` code in the tests, examples and benchmarks as well as the
+  library. Functions that return a `Result` document their errors.
+
+- **Idiomatic internals.** The decoders' steps return a `Result` in place of a success flag,
+  so a failure passes up with `?`; the reason for it is recorded where stb_image records it,
+  so every reason given is the same. The zlib decoder's Huffman tables report their own
+  failure in place of filling in an out-parameter.
+
+- Output is unchanged, checked against `stb_image.h` on 360,000 files, and so is speed (the
+  same instruction count to within 0.001%).
+
 ## 0.2.0
 
 - **Breaking: an idiomatic API.** The readers drop the original's `_from_memory` suffix:

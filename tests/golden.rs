@@ -1,4 +1,4 @@
-//! The port of stb_image.h against results recorded from the original, so that a change shows
+//! The port of `stb_image.h` against results recorded from the original, so that a change shows
 //! without a C compiler at hand.
 //!
 //! `tests/data/stb_image_expected.txt` is what `compare/dump_stb_image.c`, built against stb
@@ -60,7 +60,7 @@ fn badly_damaged_files_are_read_or_refused() {
         }
         for _ in 0..4 {
             // A few bytes changed, more each time round; now and then the end cut off too.
-            for _ in 0..1 + r.next() % 6 {
+            for _ in 0..=(r.next() % 6) {
                 let at = r.next() as usize % file.len();
                 file[at] = r.next() as u8;
             }

@@ -1,19 +1,27 @@
 //! The PSD reader: `stbi__psd_*`, by Thatcher Ulrich, integration by Nicolas Schulz, tweaked by
 //! stb. The merged image of an RGB file only.
 
+use core::cmp::Ordering;
+
 use super::{
-    Context, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid,
+    Context, Failed, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, convert_format,
+    mad3sizes_valid,
 };
 
 /// `stbi__psd_test`
 pub(crate) fn psd_test(s: &mut Context) -> bool {
-    let r = s.get32be() == 0x38425053;
+    let r = s.get32be() == 0x3842_5053;
     s.rewind();
     r
 }
 
 /// `stbi__psd_decode_rle`: `pixel_count` values into every fourth byte of `out` from `start`.
-fn psd_decode_rle(s: &mut Context, out: &mut [u8], start: usize, pixel_count: i32) -> bool {
+fn psd_decode_rle(
+    s: &mut Context,
+    out: &mut [u8],
+    start: usize,
+    pixel_count: i32,
+) -> Result<(), Failed> {
     let mut p = start;
     let mut count = 0i32;
     loop {
@@ -22,37 +30,39 @@ fn psd_decode_rle(s: &mut Context, out: &mut [u8], start: usize, pixel_count: i3
             break;
         }
         let mut len = i32::from(s.get8());
-        if len == 128 {
-            // No-op.
-        } else if len < 128 {
-            // Copy next len+1 bytes literally.
-            len += 1;
-            if len > nleft {
-                return false; // corrupt data
+        match len.cmp(&128) {
+            Ordering::Equal => {} // No-op.
+            Ordering::Less => {
+                // Copy next len+1 bytes literally.
+                len += 1;
+                if len > nleft {
+                    return Err(Failed); // corrupt data
+                }
+                count += len;
+                while len != 0 {
+                    out[p] = s.get8();
+                    p += 4;
+                    len -= 1;
+                }
             }
-            count += len;
-            while len != 0 {
-                out[p] = s.get8();
-                p += 4;
-                len -= 1;
-            }
-        } else {
-            // Next -len+1 bytes in the dest are replicated from next source byte.
-            // (Interpret len as a negative 8-bit int.)
-            len = 257 - len;
-            if len > nleft {
-                return false; // corrupt data
-            }
-            let val = s.get8();
-            count += len;
-            while len != 0 {
-                out[p] = val;
-                p += 4;
-                len -= 1;
+            Ordering::Greater => {
+                // Next -len+1 bytes in the dest are replicated from next source byte.
+                // (Interpret len as a negative 8-bit int.)
+                len = 257 - len;
+                if len > nleft {
+                    return Err(Failed); // corrupt data
+                }
+                let val = s.get8();
+                count += len;
+                while len != 0 {
+                    out[p] = val;
+                    p += 4;
+                    len -= 1;
+                }
             }
         }
     }
-    true
+    Ok(())
 }
 
 /// A float made an integer as x86 does it, as the C does with `(unsigned char)` and
@@ -66,9 +76,12 @@ fn x86_int(value: f32) -> i32 {
 /// `stbi__psd_load`: the pixels, at 16 bits a channel when the file has them uncompressed and
 /// `bpc` asks for 16; with them, the channels in the file (always 4). The size goes into the
 /// context.
+// (One pass, step for step as stb_image's, its state shared throughout; the names are stb_image's,
+// so that the code reads against the original.)
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 pub(crate) fn psd_load(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixels, i32)> {
     // Check identifier
-    if s.get32be() != 0x38425053 {
+    if s.get32be() != 0x3842_5053 {
         // "8BPS"
         return s.errp("not PSD");
     }
@@ -178,7 +191,7 @@ pub(crate) fn psd_load(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixe
                 }
             } else {
                 // Read the RLE data.
-                if !psd_decode_rle(s, &mut out, channel as usize, pixel_count) {
+                if psd_decode_rle(s, &mut out, channel as usize, pixel_count).is_err() {
                     return s.errp("corrupt");
                 }
             }
@@ -267,7 +280,7 @@ pub(crate) fn psd_load(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixe
 
 /// `stbi__psd_info`
 pub(crate) fn psd_info(s: &mut Context) -> Option<RawInfo> {
-    if s.get32be() != 0x38425053 {
+    if s.get32be() != 0x3842_5053 {
         s.rewind();
         return None;
     }

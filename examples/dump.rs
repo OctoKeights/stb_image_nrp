@@ -1,12 +1,12 @@
-//! The Rust half of the comparison with stb_image.h: runs the port over synthetic data and
+//! The Rust half of the comparison with `stb_image.h`: runs the port over synthetic data and
 //! prints a running hash of what comes out, as `compare/dump_stb_image.c` does with the original.
 //! `compare/compare.sh` compares the two.
 //!
-//!   dump stb_image <seed> <count>        synthetic .png, .bmp and .jpg files of every kind, a third
+//!   dump `stb_image` <seed> <count>        synthetic .png, .bmp and .jpg files of every kind, a third
 //!                                        of them damaged, asked their size and read at 8 and 16
 //!                                        bits a channel; and synthetic data through the zlib
 //!                                        decoder, whole and damaged
-//!   dump stb_image_more <seed> <count>   synthetic .tga, .psd, .gif, .pnm and .hdr files, a third
+//!   dump `stb_image_more` <seed> <count>   synthetic .tga, .psd, .gif, .pnm and .hdr files, a third
 //!                                        of them damaged, read at 8 and 16 bits a channel, as
 //!                                        floats and as animations
 

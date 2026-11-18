@@ -7,7 +7,7 @@
 //! It checks no Adler-32 checksum. (It is here so that a PNG is read as the original reads it,
 //! the damaged ones too.)
 
-use super::LoadError;
+use super::{Failed, LoadError};
 
 // fast-way is faster to check than jpeg huffman, but slow way is slower
 const STBI_ZFAST_BITS: usize = 9; // accelerate all cases in default tables
@@ -80,10 +80,10 @@ struct Zbuf<'a> {
 }
 
 impl Zbuf<'_> {
-    /// `stbi__err`
-    fn err(&mut self, reason: &'static str) -> bool {
+    /// `stbi__err`, for a step that fails: records `reason` as the failure's.
+    fn fail<T>(&mut self, reason: &'static str) -> Result<T, Failed> {
         self.reason = Some(reason);
-        false
+        Err(Failed)
     }
 
     /// `stbi__zeof`
@@ -128,9 +128,9 @@ impl Zbuf<'_> {
     }
 
     /// `stbi__zexpand`: need to make room for n bytes
-    fn zexpand(&mut self, n: i32) -> bool {
+    fn zexpand(&mut self, n: i32) -> Result<(), Failed> {
         if !self.z_expandable {
-            return self.err("output buffer limit");
+            return self.fail("output buffer limit");
         }
         let cur = self.zout.len() as u32;
         let mut limit = self.limit;
@@ -138,28 +138,28 @@ impl Zbuf<'_> {
             limit = 1;
         }
         if u32::MAX - cur < n as u32 {
-            return self.err("outofmem");
+            return self.fail("outofmem");
         }
         while cur + n as u32 > limit {
             if limit > u32::MAX / 2 {
-                return self.err("outofmem");
+                return self.fail("outofmem");
             }
             limit *= 2;
         }
         self.limit = limit;
-        true
+        Ok(())
     }
 
     /// `stbi__parse_huffman_block`
-    fn parse_huffman_block(&mut self) -> bool {
+    fn parse_huffman_block(&mut self) -> Result<(), Failed> {
         loop {
             let mut z = zhuffman_decode(self, false);
             if z < 256 {
                 if z < 0 {
-                    return self.err("bad huffman code"); // error in huffman codes
+                    return self.fail("bad huffman code"); // error in huffman codes
                 }
-                if self.zout.len() as u32 >= self.limit && !self.zexpand(1) {
-                    return false;
+                if self.zout.len() as u32 >= self.limit {
+                    self.zexpand(1)?;
                 }
                 self.zout.push(z as u8);
             } else {
@@ -170,13 +170,13 @@ impl Zbuf<'_> {
                         // actually consumed any of those bits
                         // (which is the case when num_bits < 16),
                         // the stream actually read past the end so it is malformed.
-                        return self.err("unexpected end");
+                        return self.fail("unexpected end");
                     }
-                    return true;
+                    return Ok(());
                 }
                 if z >= 286 {
                     // per DEFLATE, length codes 286 and 287 must not appear in compressed data
-                    return self.err("bad huffman code");
+                    return self.fail("bad huffman code");
                 }
                 z -= 257;
                 let mut len = STBI_ZLENGTH_BASE[z as usize];
@@ -186,19 +186,19 @@ impl Zbuf<'_> {
                 z = zhuffman_decode(self, true);
                 if !(0..30).contains(&z) {
                     // per DEFLATE, distance codes 30 and 31 must not appear in compressed data
-                    return self.err("bad huffman code");
+                    return self.fail("bad huffman code");
                 }
                 let mut dist = STBI_ZDIST_BASE[z as usize];
                 if STBI_ZDIST_EXTRA[z as usize] != 0 {
                     dist += self.zreceive(STBI_ZDIST_EXTRA[z as usize]) as i32;
                 }
                 if (self.zout.len() as i64) < i64::from(dist) {
-                    return self.err("bad dist");
+                    return self.fail("bad dist");
                 }
                 if i64::from(len) > i64::from(self.limit) - self.zout.len() as i64
-                    && !self.zexpand(len)
+                    && self.zexpand(len).is_err()
                 {
-                    return false;
+                    return Err(Failed);
                 }
                 let from = self.zout.len() - dist as usize;
                 let len = len as usize;
@@ -221,7 +221,7 @@ impl Zbuf<'_> {
     }
 
     /// `stbi__compute_huffman_codes`
-    fn compute_huffman_codes(&mut self) -> bool {
+    fn compute_huffman_codes(&mut self) -> Result<(), Failed> {
         static LENGTH_DEZIGZAG: [u8; 19] = [
             16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
         ];
@@ -238,15 +238,13 @@ impl Zbuf<'_> {
             let s = self.zreceive(3);
             codelength_sizes[usize::from(LENGTH_DEZIGZAG[i])] = s as u8;
         }
-        if !zbuild_huffman(&mut z_codelength, &codelength_sizes, &mut self.reason) {
-            return false;
-        }
+        zbuild_huffman(&mut z_codelength, &codelength_sizes).or_else(|reason| self.fail(reason))?;
 
         let mut n = 0i32;
         while n < ntot {
             let mut c = zhuffman_decode_with(self, &z_codelength);
             if !(0..19).contains(&c) {
-                return self.err("bad codelengths");
+                return self.fail("bad codelengths");
             }
             if c < 16 {
                 lencodes[n as usize] = c as u8;
@@ -256,7 +254,7 @@ impl Zbuf<'_> {
                 if c == 16 {
                     c = self.zreceive(2) as i32 + 3;
                     if n == 0 {
-                        return self.err("bad codelengths");
+                        return self.fail("bad codelengths");
                     }
                     fill = lencodes[n as usize - 1];
                 } else if c == 17 {
@@ -264,37 +262,30 @@ impl Zbuf<'_> {
                 } else if c == 18 {
                     c = self.zreceive(7) as i32 + 11;
                 } else {
-                    return self.err("bad codelengths");
+                    return self.fail("bad codelengths");
                 }
                 if ntot - n < c {
-                    return self.err("bad codelengths");
+                    return self.fail("bad codelengths");
                 }
                 lencodes[n as usize..(n + c) as usize].fill(fill);
                 n += c;
             }
         }
         if n != ntot {
-            return self.err("bad codelengths");
+            return self.fail("bad codelengths");
         }
-        if !zbuild_huffman(
-            &mut self.z_length,
-            &lencodes[..hlit as usize],
-            &mut self.reason,
-        ) {
-            return false;
-        }
-        if !zbuild_huffman(
+        zbuild_huffman(&mut self.z_length, &lencodes[..hlit as usize])
+            .or_else(|reason| self.fail(reason))?;
+        zbuild_huffman(
             &mut self.z_distance,
             &lencodes[hlit as usize..(hlit + hdist) as usize],
-            &mut self.reason,
-        ) {
-            return false;
-        }
-        true
+        )
+        .or_else(|reason| self.fail(reason))?;
+        Ok(())
     }
 
     /// `stbi__parse_uncompressed_block`
-    fn parse_uncompressed_block(&mut self) -> bool {
+    fn parse_uncompressed_block(&mut self) -> Result<(), Failed> {
         let mut header = [0u8; 4];
         if self.num_bits & 7 != 0 {
             self.zreceive(self.num_bits & 7); // discard
@@ -308,7 +299,7 @@ impl Zbuf<'_> {
             self.num_bits -= 8;
         }
         if self.num_bits < 0 {
-            return self.err("zlib corrupt");
+            return self.fail("zlib corrupt");
         }
         // now fill header the normal way
         while k < 4 {
@@ -318,47 +309,48 @@ impl Zbuf<'_> {
         let len = usize::from(header[1]) * 256 + usize::from(header[0]);
         let nlen = usize::from(header[3]) * 256 + usize::from(header[2]);
         if nlen != (len ^ 0xffff) {
-            return self.err("zlib corrupt");
+            return self.fail("zlib corrupt");
         }
         if self.at + len > self.zbuffer.len() {
-            return self.err("read past buffer");
+            return self.fail("read past buffer");
         }
-        if self.zout.len() as u64 + len as u64 > u64::from(self.limit) && !self.zexpand(len as i32)
+        if self.zout.len() as u64 + len as u64 > u64::from(self.limit)
+            && self.zexpand(len as i32).is_err()
         {
-            return false;
+            return Err(Failed);
         }
         self.zout
             .extend_from_slice(&self.zbuffer[self.at..self.at + len]);
         self.at += len;
-        true
+        Ok(())
     }
 
     /// `stbi__parse_zlib_header`
-    fn parse_zlib_header(&mut self) -> bool {
+    fn parse_zlib_header(&mut self) -> Result<(), Failed> {
         let cmf = i32::from(self.zget8());
         let cm = cmf & 15;
         /* int cinfo = cmf >> 4; */
         let flg = i32::from(self.zget8());
         if self.zeof() {
-            return self.err("bad zlib header"); // zlib spec
+            return self.fail("bad zlib header"); // zlib spec
         }
         if (cmf * 256 + flg) % 31 != 0 {
-            return self.err("bad zlib header"); // zlib spec
+            return self.fail("bad zlib header"); // zlib spec
         }
         if flg & 32 != 0 {
-            return self.err("no preset dict"); // preset dictionary not allowed in png
+            return self.fail("no preset dict"); // preset dictionary not allowed in png
         }
         if cm != 8 {
-            return self.err("bad compression"); // DEFLATE required for png
+            return self.fail("bad compression"); // DEFLATE required for png
         }
         // window = 1 << (8 + cinfo)... but who cares, we fully buffer output
-        true
+        Ok(())
     }
 
     /// `stbi__parse_zlib`
-    fn parse_zlib(&mut self, parse_header: bool) -> bool {
-        if parse_header && !self.parse_zlib_header() {
-            return false;
+    fn parse_zlib(&mut self, parse_header: bool) -> Result<(), Failed> {
+        if parse_header {
+            self.parse_zlib_header()?;
         }
         self.num_bits = 0;
         self.code_buffer = 0;
@@ -367,42 +359,33 @@ impl Zbuf<'_> {
             let last = self.zreceive(1);
             let kind = self.zreceive(2);
             if kind == 0 {
-                if !self.parse_uncompressed_block() {
-                    return false;
-                }
+                self.parse_uncompressed_block()?;
             } else if kind == 3 {
-                return false;
+                return Err(Failed);
             } else {
                 if kind == 1 {
                     // use fixed code lengths
-                    if !zbuild_huffman(&mut self.z_length, &STBI_ZDEFAULT_LENGTH, &mut self.reason)
-                    {
-                        return false;
-                    }
-                    if !zbuild_huffman(
-                        &mut self.z_distance,
-                        &STBI_ZDEFAULT_DISTANCE,
-                        &mut self.reason,
-                    ) {
-                        return false;
-                    }
-                } else if !self.compute_huffman_codes() {
-                    return false;
+                    zbuild_huffman(&mut self.z_length, &STBI_ZDEFAULT_LENGTH)
+                        .or_else(|reason| self.fail(reason))?;
+                    zbuild_huffman(&mut self.z_distance, &STBI_ZDEFAULT_DISTANCE)
+                        .or_else(|reason| self.fail(reason))?;
+                } else {
+                    self.compute_huffman_codes()?;
                 }
-                if !self.parse_huffman_block() {
-                    return false;
-                }
+                self.parse_huffman_block()?;
             }
             if last != 0 {
                 break;
             }
         }
-        true
+        Ok(())
     }
 }
 
 /// `stbi__zbuild_huffman`
-fn zbuild_huffman(z: &mut ZHuffman, sizelist: &[u8], reason: &mut Option<&'static str>) -> bool {
+// (The names are stb_image's, so that the code reads against the original.)
+#[allow(clippy::many_single_char_names)]
+fn zbuild_huffman(z: &mut ZHuffman, sizelist: &[u8]) -> Result<(), &'static str> {
     let mut k = 0i32;
     let mut next_code = [0i32; 16];
     let mut sizes = [0i32; 17];
@@ -420,8 +403,7 @@ fn zbuild_huffman(z: &mut ZHuffman, sizelist: &[u8], reason: &mut Option<&'stati
         .take(15)
         .any(|(i, &n)| n > 1 << i)
     {
-        *reason = Some("bad sizes");
-        return false;
+        return Err("bad sizes");
     }
     let mut code = 0i32;
     for i in 1..16 {
@@ -430,8 +412,7 @@ fn zbuild_huffman(z: &mut ZHuffman, sizelist: &[u8], reason: &mut Option<&'stati
         z.firstsymbol[i] = k as u16;
         code += sizes[i];
         if sizes[i] != 0 && code > 1 << i {
-            *reason = Some("bad codelengths");
-            return false;
+            return Err("bad codelengths");
         }
         z.maxcode[i] = code << (16 - i); // preshift for inner loop
         code <<= 1;
@@ -456,7 +437,7 @@ fn zbuild_huffman(z: &mut ZHuffman, sizelist: &[u8], reason: &mut Option<&'stati
             next_code[s] += 1;
         }
     }
-    true
+    Ok(())
 }
 
 /// `stbi__zhuffman_decode_slowpath`
@@ -510,17 +491,16 @@ fn zhuffman_decode_with(a: &mut Zbuf, z: &ZHuffman) -> i32 {
 fn zhuffman_ready(a: &mut Zbuf) -> bool {
     if a.num_bits < 16 {
         if a.zeof() {
-            if !a.hit_zeof_once {
-                // This is the first time we hit eof, insert 16 extra padding btis
-                // to allow us to keep going; if we actually consume any of them
-                // though, that is invalid data. This is caught later.
-                a.hit_zeof_once = true;
-                a.num_bits += 16; // add 16 implicit zero bits
-            } else {
+            if a.hit_zeof_once {
                 // We already inserted our extra 16 padding bits and are again
                 // out, this stream is actually prematurely terminated.
                 return false;
             }
+            // This is the first time we hit eof, insert 16 extra padding btis
+            // to allow us to keep going; if we actually consume any of them
+            // though, that is invalid data. This is caught later.
+            a.hit_zeof_once = true;
+            a.num_bits += 16; // add 16 implicit zero bits
         } else {
             a.fill_bits();
         }
@@ -598,7 +578,7 @@ fn do_zlib(
         z_distance: ZHuffman::new(),
         reason: None,
     };
-    if a.parse_zlib(parse_header) {
+    if a.parse_zlib(parse_header).is_ok() {
         Ok(a.zout)
     } else {
         Err(a.reason)
@@ -638,6 +618,10 @@ pub enum Format {
 /// Decompresses a zlib or raw DEFLATE stream (`stbi_zlib_decode_malloc` and
 /// `stbi_zlib_decode_noheader_malloc`).
 ///
+/// # Errors
+///
+/// A stream that is corrupt or ends early, with `stb_image`'s reason for the failure.
+///
 /// ```
 /// use stb_image_nrp::zlib::{Format, decompress};
 ///
@@ -652,6 +636,10 @@ pub fn decompress(stream: &[u8], format: Format) -> Result<Vec<u8>, LoadError> {
 /// Decompresses a zlib or raw DEFLATE stream that holds no more than `max_len` bytes
 /// (`stbi_zlib_decode_buffer` and `stbi_zlib_decode_noheader_buffer`). A stream that holds
 /// more fails with the reason `"output buffer limit"`.
+///
+/// # Errors
+///
+/// As [`decompress`], and a stream that holds more than `max_len` bytes.
 pub fn decompress_with_limit(
     stream: &[u8],
     format: Format,
