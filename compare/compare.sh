@@ -24,7 +24,7 @@ seeds=${3:-3}
 dumps=${4:-stb_image stb_image_more}
 tmp=${TMPDIR:-/tmp}/stb_image_nrp-compare
 mkdir -p "$tmp" || exit 2
-if ! [ -f "$source/stb_image.h" ] && [ -f "$source/stb_image_write.h" ]; then
+if [ ! -f "$source/stb_image.h" ] || [ ! -f "$source/stb_image_write.h" ]; then
     echo "$source does not look like checkout of stb" >&2
     exit 2
 fi
