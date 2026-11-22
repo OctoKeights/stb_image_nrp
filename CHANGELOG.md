@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0
+
+- **Softimage `.pic`, EXIF orientation, streaming readers and `fast-zlib`.** Ported
+  `stb_image.h`'s Softimage `.pic` reader (`ImageFormat::Pic`), added EXIF orientation tag
+  parsing and lossless pixel transforms (`exif_orientation`,
+  `LoadOptions::apply_exif_orientation`), added `std::io::Read` and file-path loading helpers
+  under the default `std` feature, and added an optional `fast-zlib` feature using
+  `libdeflate_nrp` 0.3 for faster PNG decompression.
+
+- **`#![no_std]` and defensive `LoadOptions` limits.** Disabling default features builds with
+  `#![no_std]` and `alloc`. `LoadOptions` adds `max_width`, `max_height`, `max_alloc_bytes`
+  and `preserve_16bit_in_f32`, `LoadError` exposes a structured `ErrorKind`, and `Image<T>`
+  adds `rows`, `pixel` and `as_bytes`.
+
+- **Memory, 32-bit overflow and DoS hardening.** Widened GIF stream offsets to `usize`,
+  checked element byte widths in `convert_format`, capped `zlib` expansion with fallible
+  `try_reserve`, checked binary PNM and TGA stream lengths before allocation, rejected 0-pixel
+  BMP/PSD loads, converted GIF frames in place (~3x lower peak RAM), reused PNG Adam7 pass
+  buffers, and replaced `ldr_to_hdr`'s `powf` with a bit-identical 256-entry lookup table.
+
+- Output is unchanged under default options, checked against `stb_image.h` on 360,000 files.
+
 ## 0.2.1
 
 - **Stricter lints, enforced in CI.** `Cargo.toml` turns on clippy's pedantic group for every

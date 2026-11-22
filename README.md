@@ -30,7 +30,7 @@ refuses, with the same reason, damaged files included.
 
 ```toml
 [dependencies]
-stb_image_nrp = "0.2"
+stb_image_nrp = "0.3"
 ```
 
 ## Quick start
