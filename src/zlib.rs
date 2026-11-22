@@ -7,6 +7,8 @@
 //! It checks no Adler-32 checksum. (It is here so that a PNG is read as the original reads it,
 //! the damaged ones too.)
 
+use alloc::vec::Vec;
+
 use super::{Failed, LoadError};
 
 // fast-way is faster to check than jpeg huffman, but slow way is slower
@@ -16,6 +18,7 @@ const STBI_ZNSYMS: usize = 288; // number of symbols in literal/length alphabet
 
 /// `stbi__zhuffman`: zlib-style huffman encoding (jpegs packs from left, zlib from right, so
 /// can't share code)
+#[derive(Clone, Copy)]
 struct ZHuffman {
     fast: [u16; 1 << STBI_ZFAST_BITS],
     firstcode: [u16; 16],
@@ -26,7 +29,7 @@ struct ZHuffman {
 }
 
 impl ZHuffman {
-    fn new() -> ZHuffman {
+    const fn new() -> ZHuffman {
         ZHuffman {
             fast: [0; 1 << STBI_ZFAST_BITS],
             firstcode: [0; 16],
@@ -39,7 +42,7 @@ impl ZHuffman {
 }
 
 /// `stbi__bitreverse16`
-fn bitreverse16(mut n: i32) -> i32 {
+const fn bitreverse16(mut n: i32) -> i32 {
     n = ((n & 0xAAAA) >> 1) | ((n & 0x5555) << 1);
     n = ((n & 0xCCCC) >> 2) | ((n & 0x3333) << 2);
     n = ((n & 0xF0F0) >> 4) | ((n & 0x0F0F) << 4);
@@ -48,11 +51,62 @@ fn bitreverse16(mut n: i32) -> i32 {
 }
 
 /// `stbi__bit_reverse`
-fn bit_reverse(v: i32, bits: i32) -> i32 {
+const fn bit_reverse(v: i32, bits: i32) -> i32 {
     debug_assert!(bits <= 16);
     // to bit reverse n bits, reverse 16 and shift
     // e.g. 11 bits, bit reverse and shift away 5
     bitreverse16(v) >> (16 - bits)
+}
+
+/// Compile-time builder for the RFC 1951 fixed literal/length and distance Huffman tables.
+const fn build_fixed_huffman<const N: usize>(sizelist: &[u8; N]) -> ZHuffman {
+    let mut table = ZHuffman::new();
+    let mut symbol_offset = 0i32;
+    let mut next_code = [0i32; 16];
+    let mut sizes = [0i32; 17];
+
+    let mut idx = 0;
+    while idx < N {
+        sizes[sizelist[idx] as usize] += 1;
+        idx += 1;
+    }
+    sizes[0] = 0;
+
+    let mut code = 0i32;
+    let mut bits = 1;
+    while bits < 16 {
+        next_code[bits] = code;
+        table.firstcode[bits] = code as u16;
+        table.firstsymbol[bits] = symbol_offset as u16;
+        code += sizes[bits];
+        table.maxcode[bits] = code << (16 - bits);
+        code <<= 1;
+        symbol_offset += sizes[bits];
+        bits += 1;
+    }
+    table.maxcode[16] = 0x10000;
+
+    let mut sym = 0;
+    while sym < N {
+        let code_len = sizelist[sym] as usize;
+        if code_len != 0 {
+            let slot = (next_code[code_len] - table.firstcode[code_len] as i32
+                + table.firstsymbol[code_len] as i32) as usize;
+            let fastv = ((code_len << 9) | sym) as u16;
+            table.size[slot] = code_len as u8;
+            table.value[slot] = sym as u16;
+            if code_len <= STBI_ZFAST_BITS {
+                let mut fast_idx = bit_reverse(next_code[code_len], code_len as i32) as usize;
+                while fast_idx < (1 << STBI_ZFAST_BITS) {
+                    table.fast[fast_idx] = fastv;
+                    fast_idx += 1 << code_len;
+                }
+            }
+            next_code[code_len] += 1;
+        }
+        sym += 1;
+    }
+    table
 }
 
 /// `stbi__zbuf`: zlib-from-memory implementation for PNG reading. Because PNG allows
@@ -78,6 +132,12 @@ struct Zbuf<'a> {
     /// (The failure reason, a global in the original.)
     reason: Option<&'static str>,
 }
+
+const MAX_ZOUT_CAP: usize = if (u32::MAX as usize) < (isize::MAX as usize) {
+    u32::MAX as usize
+} else {
+    isize::MAX as usize
+};
 
 impl Zbuf<'_> {
     /// `stbi__err`, for a step that fails: records `reason` as the failure's.
@@ -127,26 +187,47 @@ impl Zbuf<'_> {
         k
     }
 
-    /// `stbi__zexpand`: need to make room for n bytes
+    /// `stbi__zexpand`: need to make room for `n` bytes, capped at `isize::MAX` (for 32-bit
+    /// targets) and `u32::MAX` (as in `stb_image.h`), using fallible `try_reserve_exact`.
     fn zexpand(&mut self, n: i32) -> Result<(), Failed> {
         if !self.z_expandable {
             return self.fail("output buffer limit");
         }
-        let cur = self.zout.len() as u32;
-        let mut limit = self.limit;
+        if n < 0 {
+            return self.fail("outofmem");
+        }
+        let cur = self.zout.len();
+        let add = n as usize;
+        if add > MAX_ZOUT_CAP.saturating_sub(cur) {
+            return self.fail("outofmem");
+        }
+        let needed = cur + add;
+        let mut limit = (self.limit as usize).min(MAX_ZOUT_CAP);
         if limit == 0 {
             limit = 1;
         }
-        if u32::MAX - cur < n as u32 {
-            return self.fail("outofmem");
-        }
-        while cur + n as u32 > limit {
-            if limit > u32::MAX / 2 {
+        while needed > limit {
+            if limit > (u32::MAX as usize) / 2 {
                 return self.fail("outofmem");
             }
-            limit *= 2;
+            limit = limit.saturating_mul(2).min(MAX_ZOUT_CAP);
         }
-        self.limit = limit;
+        if self.zout.try_reserve_exact(limit - cur).is_err() {
+            return self.fail("outofmem");
+        }
+        self.limit = limit as u32;
+        Ok(())
+    }
+
+    /// Ensures `self.zout` has capacity for `additional` more bytes without panicking on OOM or
+    /// 32-bit `isize::MAX` overflow.
+    #[inline]
+    fn ensure_capacity(&mut self, additional: usize) -> Result<(), Failed> {
+        if additional > self.zout.capacity() - self.zout.len()
+            && self.zout.try_reserve(additional).is_err()
+        {
+            return self.fail("outofmem");
+        }
         Ok(())
     }
 
@@ -161,6 +242,7 @@ impl Zbuf<'_> {
                 if self.zout.len() as u32 >= self.limit {
                     self.zexpand(1)?;
                 }
+                self.ensure_capacity(1)?;
                 self.zout.push(z as u8);
             } else {
                 if z == 256 {
@@ -195,13 +277,12 @@ impl Zbuf<'_> {
                 if (self.zout.len() as i64) < i64::from(dist) {
                     return self.fail("bad dist");
                 }
-                if i64::from(len) > i64::from(self.limit) - self.zout.len() as i64
-                    && self.zexpand(len).is_err()
-                {
-                    return Err(Failed);
+                if i64::from(len) > i64::from(self.limit) - self.zout.len() as i64 {
+                    self.zexpand(len)?;
                 }
                 let from = self.zout.len() - dist as usize;
                 let len = len as usize;
+                self.ensure_capacity(len)?;
                 if dist == 1 {
                     // run of one byte; common in images.
                     let v = self.zout[from];
@@ -210,7 +291,6 @@ impl Zbuf<'_> {
                     // (A copy that does not overlap what it writes: all at once.)
                     self.zout.extend_from_within(from..from + len);
                 } else {
-                    self.zout.reserve(len);
                     for i in from..from + len {
                         let v = self.zout[i];
                         self.zout.push(v);
@@ -314,11 +394,10 @@ impl Zbuf<'_> {
         if self.at + len > self.zbuffer.len() {
             return self.fail("read past buffer");
         }
-        if self.zout.len() as u64 + len as u64 > u64::from(self.limit)
-            && self.zexpand(len as i32).is_err()
-        {
-            return Err(Failed);
+        if self.zout.len() as u64 + len as u64 > u64::from(self.limit) {
+            self.zexpand(len as i32)?;
         }
+        self.ensure_capacity(len)?;
         self.zout
             .extend_from_slice(&self.zbuffer[self.at..self.at + len]);
         self.at += len;
@@ -364,11 +443,9 @@ impl Zbuf<'_> {
                 return Err(Failed);
             } else {
                 if kind == 1 {
-                    // use fixed code lengths
-                    zbuild_huffman(&mut self.z_length, &STBI_ZDEFAULT_LENGTH)
-                        .or_else(|reason| self.fail(reason))?;
-                    zbuild_huffman(&mut self.z_distance, &STBI_ZDEFAULT_DISTANCE)
-                        .or_else(|reason| self.fail(reason))?;
+                    // Precomputed RFC 1951 fixed Huffman tables (`const` at compile time).
+                    self.z_length = FIXED_LENGTH;
+                    self.z_distance = FIXED_DISTANCE;
                 } else {
                     self.compute_huffman_codes()?;
                 }
@@ -540,7 +617,7 @@ static STBI_ZDIST_EXTRA: [i32; 32] = [
 ];
 
 /// `stbi__zdefault_length`
-static STBI_ZDEFAULT_LENGTH: [u8; STBI_ZNSYMS] = {
+const STBI_ZDEFAULT_LENGTH: [u8; STBI_ZNSYMS] = {
     let mut lengths = [8u8; STBI_ZNSYMS];
     let mut i = 144;
     while i <= 255 {
@@ -555,7 +632,10 @@ static STBI_ZDEFAULT_LENGTH: [u8; STBI_ZNSYMS] = {
 };
 
 /// `stbi__zdefault_distance`
-static STBI_ZDEFAULT_DISTANCE: [u8; 32] = [5; 32];
+const STBI_ZDEFAULT_DISTANCE: [u8; 32] = [5; 32];
+
+const FIXED_LENGTH: ZHuffman = build_fixed_huffman(&STBI_ZDEFAULT_LENGTH);
+const FIXED_DISTANCE: ZHuffman = build_fixed_huffman(&STBI_ZDEFAULT_DISTANCE);
 
 /// `stbi__do_zlib`: the decoded bytes, or the reason there are none (which is none itself
 /// where the original sets none).
@@ -586,10 +666,13 @@ fn do_zlib(
 }
 
 /// `stbi_zlib_decode_malloc_guesssize_headerflag`, as the PNG reader calls it: the reason is
-/// none where the original sets none.
+/// none where the original sets none. When the `fast-zlib` feature is enabled, valid RFC 1950
+/// zlib streams are accelerated via `libdeflate_nrp`, falling back seamlessly to `do_zlib` on
+/// raw-DEFLATE (`CgBI`) or damaged streams.
 pub(crate) fn decode_for_png(
     buffer: &[u8],
     initial_size: u32,
+    expected_out_max: Option<usize>,
     parse_header: bool,
 ) -> Result<Vec<u8>, Option<&'static str>> {
     // (The original takes the size as an int, and has no memory to start with when that is
@@ -597,6 +680,18 @@ pub(crate) fn decode_for_png(
     if (initial_size as i32) < 0 {
         return Err(None);
     }
+    #[cfg(feature = "fast-zlib")]
+    if parse_header
+        && let Some(expected) = expected_out_max
+        && expected <= buffer.len().saturating_mul(1032).saturating_add(64)
+        && let Some(mut out) = super::try_alloc_zeroed::<u8>(expected.saturating_add(16))
+        && let Ok(res) = libdeflate_nrp::zlib_decompress(buffer, &mut out)
+    {
+        out.truncate(res.bytes_written);
+        return Ok(out);
+    }
+    #[cfg(not(feature = "fast-zlib"))]
+    let _ = expected_out_max;
     do_zlib(buffer, initial_size, true, parse_header)
 }
 
@@ -659,6 +754,53 @@ mod tests {
     use miniz_nrp as miniz;
 
     #[test]
+    fn const_fixed_huffman_tables_match_runtime_builder() {
+        let mut runtime_len = ZHuffman::new();
+        zbuild_huffman(&mut runtime_len, &STBI_ZDEFAULT_LENGTH).unwrap();
+        assert_eq!(FIXED_LENGTH.fast, runtime_len.fast);
+        assert_eq!(FIXED_LENGTH.firstcode, runtime_len.firstcode);
+        assert_eq!(FIXED_LENGTH.maxcode, runtime_len.maxcode);
+        assert_eq!(FIXED_LENGTH.firstsymbol, runtime_len.firstsymbol);
+        assert_eq!(FIXED_LENGTH.size, runtime_len.size);
+        assert_eq!(FIXED_LENGTH.value, runtime_len.value);
+
+        let mut runtime_dist = ZHuffman::new();
+        zbuild_huffman(&mut runtime_dist, &STBI_ZDEFAULT_DISTANCE).unwrap();
+        assert_eq!(FIXED_DISTANCE.fast, runtime_dist.fast);
+        assert_eq!(FIXED_DISTANCE.firstcode, runtime_dist.firstcode);
+        assert_eq!(FIXED_DISTANCE.maxcode, runtime_dist.maxcode);
+        assert_eq!(FIXED_DISTANCE.firstsymbol, runtime_dist.firstsymbol);
+        assert_eq!(FIXED_DISTANCE.size, runtime_dist.size);
+        assert_eq!(FIXED_DISTANCE.value, runtime_dist.value);
+    }
+
+    #[test]
+    fn zexpand_rejects_negative_and_overflowing_requests_cleanly() {
+        let mut z = Zbuf {
+            zbuffer: &[],
+            at: 0,
+            num_bits: 0,
+            hit_zeof_once: false,
+            code_buffer: 0,
+            zout: Vec::new(),
+            limit: u32::MAX / 2 + 2,
+            z_expandable: true,
+            z_length: ZHuffman::new(),
+            z_distance: ZHuffman::new(),
+            reason: None,
+        };
+        assert!(z.zexpand(-1).is_err());
+        assert_eq!(z.reason, Some("outofmem"));
+        // Requesting expansion when `limit > u32::MAX / 2` and `cur + n > limit` fails cleanly
+        // with `"outofmem"` instead of overflowing.
+        z.reason = None;
+        z.zout = alloc::vec![0u8; 16];
+        z.limit = u32::MAX / 2 + 2;
+        assert!(z.zexpand(i32::MAX).is_err());
+        assert_eq!(z.reason, Some("outofmem"));
+    }
+
+    #[test]
     fn streams_of_every_kind_of_block_come_back() {
         let text: Vec<u8> = (0..30000u32)
             .map(|i| b"the quick brown fox "[(i % 20) as usize] ^ (i / 997) as u8)
@@ -679,7 +821,7 @@ mod tests {
                 Ok(&text[..])
             );
             assert_eq!(
-                decompress(&packed[2..], if false { Format::Zlib } else { Format::Raw }).as_deref(),
+                decode_for_png(&packed, text.len() as u32, Some(text.len()), true).as_deref(),
                 Ok(&text[..])
             );
             // Into too little room.
@@ -691,6 +833,10 @@ mod tests {
         // The fixed codes.
         let fixed = stb_image_write_nrp::zlib_compress(&text, 8);
         assert_eq!(decompress(&fixed, Format::Zlib).as_deref(), Ok(&text[..]));
+        assert_eq!(
+            decode_for_png(&fixed, text.len() as u32, Some(text.len()), true).as_deref(),
+            Ok(&text[..])
+        );
     }
 
     #[test]

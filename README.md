@@ -7,8 +7,8 @@
 ---
 
 stb_image_nrp is a native Rust port of every reader of Sean Barrett's
-[`stb_image.h`](https://github.com/nothings/stb) v2.32: PNG, BMP, JPEG, GIF, TGA, PSD, PNM
-and HDR. It produces the pixels the original produces, and refuses the files the original
+[`stb_image.h`](https://github.com/nothings/stb) v2.32: PNG, BMP, JPEG, GIF, TGA, PSD, PNM,
+HDR and PIC. It produces the pixels the original produces, and refuses the files the original
 refuses, with the same reason, damaged files included.
 
 ## Highlights
@@ -17,9 +17,12 @@ refuses, with the same reason, damaged files included.
   channels requested, and every frame of an animated GIF with its delay.
 
 - **The same refusals.** A damaged file is read as the original reads it, or refused with
-  the original's reason.
+  the original's reason (categorised via `LoadError::kind` / `ErrorKind`).
 
-- **Zero dependencies.** Standard library only: no C compiler, no build script.
+- **`#![no_std]` ready.** Zero dependencies by default (`std` enabled by default for
+  `std::io::Read` and file-path helpers; disable default features for `no_std` + `alloc`).
+  Enable the optional `fast-zlib` feature to accelerate valid PNG `IDAT` decompression with
+  `libdeflate_nrp`.
 
 - **No `unsafe` code.** Enforced by `#![forbid(unsafe_code)]`.
 
@@ -44,7 +47,8 @@ assert_eq!((info.format, info.width, info.height), (ImageFormat::Pnm, 2, 1));
 // Read as RGBA (None keeps the file's channels).
 let image = load(file, Some(Channels::Rgba), &LoadOptions::default()).unwrap();
 assert_eq!(image.channels_in_file, Channels::Rgb);
-assert_eq!(image.data, [255, 0, 0, 255, 0, 0, 255, 255]);
+assert_eq!(image.as_bytes(), [255, 0, 0, 255, 0, 0, 255, 255]);
+assert_eq!(image.pixel(1, 0), Some(&[0, 0, 255, 255][..]));
 
 // A damaged file is refused with the original's reason.
 assert!(load(&file[..12], None, &LoadOptions::default()).is_err());
@@ -62,9 +66,12 @@ assert!(load(&file[..12], None, &LoadOptions::default()).is_err());
 | PSD | The merged image of an RGB file, 8 or 16 bits a channel, raw or run-length encoded |
 | PNM | PGM and PPM, binary and text, 8 or 16 bits a channel |
 | HDR | Radiance RGBE files, flat or run-length encoded |
+| PIC | Softimage PIC files, 8 bits a channel, uncompressed or run-length encoded |
 
-Files are read from memory. The PNG reader's zlib decoder is available on its own, as the
-`zlib` module.
+Files are read from slices (and, with the default `std` feature, from `std::io::Read` streams
+or file paths). EXIF orientation (`1..=8`) can be inspected with `exif_orientation` or
+applied automatically via `LoadOptions::with_apply_exif_orientation`. The PNG reader's zlib
+decoder is available on its own, as the `zlib` module.
 
 ## Licence
 

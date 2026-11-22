@@ -1,13 +1,15 @@
 //! The GIF reader: `stbi__gif_*`, public domain by Jean-Marc Lienher, simplified and shrunk by
 //! stb. Every frame of an animation, or the first.
 
+use alloc::vec::Vec;
+
 use super::{
     Channels, Context, Failed, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, addints_valid,
-    convert_format, mad3sizes_valid, vertical_flip,
+    convert_rgba_in_place, mad3sizes_valid, try_alloc_zeroed, try_with_capacity, vertical_flip,
 };
 
 /// Every frame of a GIF file, as [`super::load_gif`] reads it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Animation {
     /// The width of the image in pixels, as its header gives it.
     pub width: u32,
@@ -20,7 +22,7 @@ pub struct Animation {
 }
 
 /// One frame of an [`Animation`]: the whole image as it stands after the frame is drawn.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Frame {
     /// The pixels, row after row from the top.
     pub data: Vec<u8>,
@@ -46,15 +48,15 @@ struct Gif {
     eflags: i32,
     color_table: Table,
     parse: i32,
-    step: i32,
+    step: usize,
     lflags: i32,
-    start_x: i32,
-    start_y: i32,
-    max_x: i32,
-    max_y: i32,
-    cur_x: i32,
-    cur_y: i32,
-    line_size: i32,
+    start_x: usize,
+    start_y: usize,
+    max_x: usize,
+    max_y: usize,
+    cur_x: usize,
+    cur_y: usize,
+    line_size: usize,
     delay: i32,
     suffix: [u8; 4096 + 1],  // one extra slot as sentinel
     prefix: [u16; 4096 + 1], // one extra slot as sentinel
@@ -356,7 +358,7 @@ fn process_gif_raster(s: &mut Context, g: &mut Gif) -> Result<(), Failed> {
                 let col = revbuf[revind];
                 if i32::from(col) != g.transparent {
                     let c = table[col as usize];
-                    let p = (g.cur_x + g.cur_y) as usize;
+                    let p = g.cur_x + g.cur_y;
                     g.out[p..p + 4].copy_from_slice(&[c[0], c[1], c[2], 255]);
                 }
                 g.cur_x += 4;
@@ -366,7 +368,7 @@ fn process_gif_raster(s: &mut Context, g: &mut Gif) -> Result<(), Failed> {
                     g.cur_y += g.step;
 
                     while g.cur_y >= g.max_y && g.parse > 0 {
-                        g.step = (1 << g.parse) * g.line_size;
+                        g.step = (1usize << g.parse) * g.line_size;
                         g.cur_y = g.start_y + (g.step >> 1);
                         g.parse -= 1;
                     }
@@ -403,7 +405,15 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
             s.set_reason("too large");
             return Next::Failed;
         }
-        g.out = vec![0; 4 * g.w as usize * g.h as usize]; // clear to transparent
+        let rgba_bytes = 4 * g.w as usize * g.h as usize;
+        if s.check_limits(g.w as u32, g.h as u32, rgba_bytes).is_err() {
+            return Next::Failed;
+        }
+        let Some(out) = try_alloc_zeroed::<u8>(rgba_bytes) else {
+            s.set_reason("outofmem");
+            return Next::Failed;
+        };
+        g.out = out; // clear to transparent
         first_frame = true;
     } else {
         // second frame - how do we dispose of the previous one?
@@ -418,7 +428,7 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
             let saved = saved.unwrap_or_default();
             let mut y = g.start_y;
             while y < g.max_y {
-                let (from, to) = ((y + g.start_x) as usize, (y + g.max_x) as usize);
+                let (from, to) = (y + g.start_x, y + g.max_x);
                 g.out[from..to].copy_from_slice(&saved[from..to]);
                 y += g.line_size;
             }
@@ -432,7 +442,7 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
                     bg[3] = 255;
                 }
                 for x in g.start_x..g.max_x {
-                    g.out[(y + x) as usize] = bg[(x & 3) as usize];
+                    g.out[y + x] = bg[x & 3];
                 }
                 y += g.line_size;
             }
@@ -455,11 +465,11 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
                     return Next::Failed;
                 }
 
-                g.line_size = g.w * 4;
-                g.start_x = x * 4;
-                g.start_y = y * g.line_size;
-                g.max_x = g.start_x + w * 4;
-                g.max_y = g.start_y + h * g.line_size;
+                g.line_size = g.w as usize * 4;
+                g.start_x = x as usize * 4;
+                g.start_y = y as usize * g.line_size;
+                g.max_x = g.start_x + w as usize * 4;
+                g.max_y = g.start_y + h as usize * g.line_size;
                 g.cur_x = g.start_x;
                 g.cur_y = g.start_y;
 
@@ -497,7 +507,7 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
                 if first_frame && g.bgindex >= 0 && g.transparent < 0 {
                     let mut bg = [0u8, 0, 0, 255];
                     bg[..3].copy_from_slice(&g.pal[g.bgindex as usize]);
-                    for (x, value) in g.out[..(g.h * g.line_size) as usize].iter_mut().enumerate() {
+                    for (x, value) in g.out[..g.h as usize * g.line_size].iter_mut().enumerate() {
                         *value = bg[x & 3];
                     }
                 }
@@ -553,6 +563,9 @@ fn gif_load_next(s: &mut Context, g: &mut Gif, saved: Option<&[u8]>) -> Next {
 
 /// `stbi__load_gif_main`
 pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<Animation> {
+    if !(0..=4).contains(&req_comp) {
+        return s.errp("bad req_comp");
+    }
     if !gif_test(s) {
         return s.errp("not GIF");
     }
@@ -560,11 +573,11 @@ pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<Animation>
     let mut g = Gif::new();
     let mut ok = true;
     let mut totalbytes = 0i32;
-    let mut frames: Vec<(i32, Vec<u8>)> = Vec::new();
+    let mut frames: Vec<Frame> = Vec::new();
     let mut saved: Option<usize> = None;
 
     loop {
-        match gif_load_next(s, &mut g, saved.map(|frame| frames[frame].1.as_slice())) {
+        match gif_load_next(s, &mut g, saved.map(|frame| frames[frame].data.as_slice())) {
             Next::Failed => {
                 ok = false;
                 break;
@@ -584,7 +597,29 @@ pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<Animation>
         }
         totalbytes += stride;
 
-        frames.push((g.delay, g.out[..stride as usize].to_vec()));
+        if s.check_limits(g.w as u32, g.h as u32, totalbytes as usize)
+            .is_err()
+        {
+            ok = false;
+            break;
+        }
+
+        let stride_usize = stride as usize;
+        let Some(mut frame_buf) = try_with_capacity::<u8>(stride_usize) else {
+            s.set_reason("outofmem");
+            ok = false;
+            break;
+        };
+        frame_buf.extend_from_slice(&g.out[..stride_usize]);
+        if frames.try_reserve(1).is_err() {
+            s.set_reason("outofmem");
+            ok = false;
+            break;
+        }
+        frames.push(Frame {
+            data: frame_buf,
+            delay_ms: g.delay,
+        });
 
         // if this frame is not in "restore to previous" disposal mode (which "un-paints" it),
         // it becomes the next reference frame
@@ -597,37 +632,32 @@ pub(crate) fn load_gif_main(s: &mut Context, req_comp: i32) -> Option<Animation>
         return None;
     }
 
+    let (w, h) = (g.w, g.h);
+    let flip = s.options.flip_vertically;
+    // Drop the decoder workspace (`g.out`, LZW tables) before post-processing frames in place.
+    drop(g);
+
     let layers = frames.len() as i32;
-    let mut out = Vec::with_capacity(totalbytes as usize);
-    let mut delays = Vec::with_capacity(frames.len());
-    for (delay, pixels) in frames {
-        delays.push(delay);
-        let at = out.len();
-        out.extend_from_slice(&pixels);
-        if s.options.flip_vertically {
-            vertical_flip(&mut out[at..], g.w as usize, g.h as usize, 4);
+    if req_comp != 0 && req_comp != 4 && !mad3sizes_valid(req_comp, w, layers * h, 0) {
+        return s.errp("outofmem");
+    }
+
+    // Flip and channel-convert each frame in place instead of concatenating and re-splitting.
+    for frame in &mut frames {
+        if flip {
+            vertical_flip(&mut frame.data, w as usize, h as usize, 4);
+        }
+        if req_comp != 0 && req_comp != 4 {
+            convert_rgba_in_place(&mut frame.data, req_comp as usize);
         }
     }
 
-    // do the final conversion after loading everything
-    if req_comp != 0 && req_comp != 4 {
-        out = convert_format(s, out, 4, req_comp, g.w as u32, (layers * g.h) as u32)?;
-    }
-
     let channels = if req_comp != 0 { req_comp } else { 4 };
-    let frame_len = (g.w * g.h * channels) as usize;
     Some(Animation {
-        width: g.w as u32,
-        height: g.h as u32,
+        width: w as u32,
+        height: h as u32,
         channels: Channels::of(channels),
-        frames: delays
-            .into_iter()
-            .enumerate()
-            .map(|(i, delay_ms)| Frame {
-                data: out[i * frame_len..(i + 1) * frame_len].to_vec(),
-                delay_ms,
-            })
-            .collect(),
+        frames,
     })
 }
 
@@ -644,7 +674,7 @@ pub(crate) fn gif_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
     // can be done for multiple frames.
     let mut u = g.out;
     if req_comp != 0 && req_comp != 4 {
-        u = convert_format(s, u, 4, req_comp, g.w as u32, g.h as u32)?;
+        convert_rgba_in_place(&mut u, req_comp as usize);
     }
     Some((u, 4))
 }
@@ -665,7 +695,10 @@ pub(crate) fn gif_info(s: &mut Context) -> Option<RawInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{LoadOptions, load, load_gif};
+    use alloc::vec::Vec;
+
+    use super::super::{Context, LoadOptions, load, load_gif};
+    use super::{Gif, process_gif_raster};
 
     /// A GIF of `w` by `h` pixels with a two-colour global table, each frame `(delay, pixels)`,
     /// written with no compression to speak of: a clear code before every pixel.
@@ -729,5 +762,31 @@ mod tests {
         );
         assert_eq!(all.frames[0].data, [10, 20, 30, 40, 50, 60]);
         assert_eq!(all.frames[1].data, [40, 50, 60, 40, 50, 60]);
+    }
+
+    #[test]
+    fn interlaced_gif_y_step_near_i32_max_does_not_overflow_or_panic() {
+        // Regression test for interlaced GIF `i32` overflow (`g.cur_y += g.step` when
+        // `start_y` is near `i32::MAX` on a 65,535-wide canvas, where `8 * line_size = 2,097,120`).
+        // Using `transparent = 0` tests the exact `process_gif_raster` row/pass progression
+        // without allocating a 2 GB buffer in the test runner!
+        let mut g = Gif::new();
+        g.line_size = 65_535 * 4; // 262,140
+        g.step = 8 * g.line_size; // 2,097,120
+        g.parse = 3;
+        g.start_x = 0;
+        g.max_x = 4;
+        g.start_y = i32::MAX as usize - 16;
+        g.max_y = g.start_y + 4;
+        g.cur_x = g.start_x;
+        g.cur_y = g.start_y;
+        g.transparent = 0;
+
+        // LZW stream with min code size = 2: clear (4), pixel 0 (0), pixel 0 (0), EOI (5).
+        // Bits: 4 (100), 0 (000), 0 (000), 5 (101) -> 12 bits = [0b00_000_100, 0b0000_101_0] = [0x04, 0x0A]
+        let raster = [2u8, 2, 0x04, 0x0A, 0];
+        let mut s = Context::new(&raster, &LoadOptions::default());
+        assert!(process_gif_raster(&mut s, &mut g).is_ok());
+        assert!(g.cur_y >= g.max_y);
     }
 }

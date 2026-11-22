@@ -6,6 +6,7 @@
 
 use super::{
     Context, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, convert_format, mad4sizes_valid,
+    try_alloc_zeroed,
 };
 
 /// `stbi__pnm_test`
@@ -150,7 +151,16 @@ pub(crate) fn pnm_load(s: &mut Context, req_comp: i32) -> Option<(Pixels, i32)> 
 
     let maxv = header.maxv;
     let nvals = (s.img_n * s.img_x as i32 * s.img_y as i32) as usize;
-    let mut out = vec![0u8; nvals * bpv as usize];
+    let total_bytes = nvals * bpv as usize;
+    if !header.isascii && s.remaining() < total_bytes {
+        return s.errp("bad PNM");
+    }
+    if s.check_limits(s.img_x, s.img_y, total_bytes).is_err() {
+        return None;
+    }
+    let Some(mut out) = try_alloc_zeroed::<u8>(total_bytes) else {
+        return s.errp("outofmem");
+    };
     if header.isascii {
         let mut c = s.get8();
         for i in 0..nvals {
@@ -177,7 +187,9 @@ pub(crate) fn pnm_load(s: &mut Context, req_comp: i32) -> Option<(Pixels, i32)> 
     let (n, x, y) = (s.img_n, s.img_x, s.img_y);
     if bpv == 2 {
         let expected_maxv = 65535u32;
-        let mut out16 = vec![0u16; nvals];
+        let Some(mut out16) = try_alloc_zeroed::<u16>(nvals) else {
+            return s.errp("outofmem");
+        };
         for (i, value) in out16.iter_mut().enumerate() {
             let mut val = (u32::from(out[i * 2]) << 8) + u32::from(out[i * 2 + 1]); // BE
             if maxv as u32 != expected_maxv {
@@ -229,6 +241,8 @@ pub(crate) fn pnm_info(s: &mut Context) -> Option<RawInfo> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::super::{LoadOptions, load, load_16};
 
     #[test]
@@ -273,5 +287,15 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.reason(), "invalid width");
+
+        // Binary P6 claiming 16,000 x 16,000 RGB (768 MB) on a tiny buffer fails immediately
+        // with `"bad PNM"` without allocating 768 MB.
+        let truncated_huge = load(
+            b"P6 16000 16000 255\n\x01\x02",
+            None,
+            &LoadOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(truncated_huge.reason(), "bad PNM");
     }
 }

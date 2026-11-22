@@ -1,8 +1,10 @@
 //! The BMP reader of `stb_image.h`: Microsoft/Windows BMP image.
 
+use alloc::vec::Vec;
+
 use super::{
     Context, Failed, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid,
-    vertical_flip,
+    try_alloc_zeroed, vertical_flip,
 };
 
 /// `stbi__bmp_test_raw`
@@ -256,6 +258,9 @@ pub(crate) fn bmp_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
     if s.img_x > STBI_MAX_DIMENSIONS {
         return s.errp("too large");
     }
+    if s.img_x == 0 || s.img_y == 0 {
+        return s.errp("0-pixel image");
+    }
 
     let (mr, mg, mb) = (info.mr, info.mg, info.mb);
     let mut ma = info.ma;
@@ -316,6 +321,9 @@ pub(crate) fn bmp_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
     // that nothing in the header refuses the file. What is not written stays zero.)
     let (img_x, img_y) = (s.img_x as i32, s.img_y as i32);
     let size = target as usize * img_x as usize * img_y as usize;
+    if s.check_limits(s.img_x, s.img_y, size).is_err() {
+        return None;
+    }
     let mut out;
     let mut z = 0usize;
     if info.bpp < 16 {
@@ -347,7 +355,10 @@ pub(crate) fn bmp_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
             return s.errp("bad bpp");
         };
         let pad = (-width) & 3;
-        out = vec![0u8; size];
+        let Some(buf) = try_alloc_zeroed::<u8>(size) else {
+            return s.errp("outofmem");
+        };
+        out = buf;
         if info.bpp == 1 {
             for _ in 0..img_y {
                 let mut bit_offset = 7;
@@ -458,7 +469,10 @@ pub(crate) fn bmp_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
                 return s.errp("bad masks");
             }
         }
-        out = vec![0u8; size];
+        let Some(buf) = try_alloc_zeroed::<u8>(size) else {
+            return s.errp("outofmem");
+        };
+        out = buf;
         for _ in 0..img_y {
             if easy != 0 {
                 for _ in 0..img_x {
@@ -740,6 +754,14 @@ mod tests {
                 &[0; 8]
             )),
             LoadError::new("bad BMP")
+        );
+        assert_eq!(
+            refused(&bmp(0, 2, 24, 0, &[], &[])),
+            LoadError::new("0-pixel image")
+        );
+        assert_eq!(
+            refused(&bmp(2, 0, 24, 0, &[], &[])),
+            LoadError::new("0-pixel image")
         );
         assert_eq!(
             refused(&bmp(1 << 25, 2, 24, 0, &[], &[])),

@@ -1,9 +1,12 @@
 //! The JPEG reader of `stb_image.h`: baseline and progressive, 8 bits a channel, with the
 //! original's plain C kernels (its `STBI_NO_SIMD` build).
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use super::{
     Context, Failed, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, Scan, addints_valid, compute_y,
-    mad2sizes_valid, mad3sizes_valid, mul2shorts_valid,
+    mad2sizes_valid, mad3sizes_valid, mul2shorts_valid, try_alloc_zeroed,
 };
 
 // huffman decoding acceleration
@@ -288,15 +291,12 @@ fn jpeg_huff_decode(j: &mut Entropy, s: &mut Context, h: &Huffman) -> i32 {
     // that way we don't need to shift inside the loop.
     let temp = j.code_buffer >> 16;
     let mut k = FAST_BITS + 1;
-    loop {
-        if temp < h.maxcode[k] {
-            break;
-        }
+    while k < 17 && temp >= h.maxcode[k] {
         k += 1;
     }
     if k == 17 {
         // error! code not found
-        j.code_bits -= 16;
+        j.code_bits = (j.code_bits - 16).max(0);
         return -1;
     }
 
@@ -1365,6 +1365,11 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> Result<(),
     if !mad3sizes_valid(s.img_x as i32, s.img_y as i32, s.img_n, 0) {
         return s.fail("too large");
     }
+    s.check_limits(
+        s.img_x,
+        s.img_y,
+        s.img_x as usize * s.img_y as usize * s.img_n as usize,
+    )?;
 
     for comp in &z.img_comp[..s.img_n as usize] {
         h_max = h_max.max(comp.h);
@@ -1412,8 +1417,13 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> Result<(),
         if !mad2sizes_valid(comp.w2, comp.h2, 15) {
             return s.fail("outofmem");
         }
+        let plane_len = comp.w2 as usize * comp.h2 as usize;
+        s.check_limits(s.img_x, s.img_y, plane_len)?;
         // (What the original leaves as it finds it, and the port has as zeros.)
-        comp.data = vec![0; comp.w2 as usize * comp.h2 as usize];
+        let Some(data) = try_alloc_zeroed::<u8>(plane_len) else {
+            return s.fail("outofmem");
+        };
+        comp.data = data;
         if z.progressive {
             // w2, h2 are multiples of 8 (see above)
             comp.coeff_w = comp.w2 / 8;
@@ -1422,8 +1432,12 @@ fn process_frame_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> Result<(),
             if !mad3sizes_valid(comp.w2, comp.h2, 2, 15) {
                 return s.fail("outofmem");
             }
+            s.check_limits(s.img_x, s.img_y, plane_len * 2)?;
             // 0 all the coeffs now so they're guaranteed to be initialized
-            comp.coeff = vec![0; comp.w2 as usize * comp.h2 as usize];
+            let Some(coeff) = try_alloc_zeroed::<i16>(plane_len) else {
+                return s.fail("outofmem");
+            };
+            comp.coeff = coeff;
         }
     }
 
@@ -1458,9 +1472,6 @@ fn decode_jpeg_header(z: &mut Jpeg, s: &mut Context, scan: Scan) -> Result<(), F
     let mut m = get_marker(&mut z.e, s);
     if !is_soi(m) {
         return s.fail("no SOI");
-    }
-    if scan == Scan::Type {
-        return Ok(());
     }
     m = get_marker(&mut z.e, s);
     while !is_sof(m) {
@@ -1734,7 +1745,10 @@ fn load_jpeg_image(z: &mut Jpeg, s: &mut Context, req_comp: i32) -> Option<(Vec<
     for (r, comp) in res_comp.iter_mut().zip(&mut z.img_comp).take(decode_n) {
         // allocate line buffer big enough for upsampling off the edges
         // with upsample factor of 4
-        comp.linebuf = vec![0; img_x + 3];
+        let Some(linebuf) = try_alloc_zeroed::<u8>(img_x + 3) else {
+            return s.errp("outofmem");
+        };
+        comp.linebuf = linebuf;
 
         r.hs = h_max / comp.h;
         r.vs = v_max / comp.v;
@@ -1757,7 +1771,13 @@ fn load_jpeg_image(z: &mut Jpeg, s: &mut Context, req_comp: i32) -> Option<(Vec<
     if !mad3sizes_valid(n as i32, s.img_x as i32, s.img_y as i32, 1) {
         return s.errp("outofmem");
     }
-    let mut output = vec![0u8; n * img_x * s.img_y as usize + 1];
+    let out_bytes = n * img_x * s.img_y as usize;
+    if s.check_limits(s.img_x, s.img_y, out_bytes).is_err() {
+        return None;
+    }
+    let Some(mut output) = try_alloc_zeroed::<u8>(out_bytes + 1) else {
+        return s.errp("outofmem");
+    };
 
     // now go ahead and resample
     for j in 0..s.img_y as usize {
@@ -1892,10 +1912,23 @@ pub(crate) fn jpeg_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)
     load_jpeg_image(&mut j, s, req_comp)
 }
 
-/// `stbi__jpeg_test`
+/// `stbi__jpeg_test`: checks the SOI marker on the stack without allocating `Box<Jpeg>`.
 pub(crate) fn jpeg_test(s: &mut Context) -> bool {
-    let mut j = Jpeg::new();
-    let r = decode_jpeg_header(&mut j, s, Scan::Type).is_ok();
+    let mut e = Entropy {
+        code_buffer: 0,
+        code_bits: 0,
+        marker: STBI_MARKER_NONE,
+        nomore: false,
+        spec_start: 0,
+        spec_end: 0,
+        succ_high: 0,
+        succ_low: 0,
+        eob_run: 0,
+    };
+    let r = is_soi(get_marker(&mut e, s));
+    if !r {
+        s.set_reason("no SOI");
+    }
     s.rewind();
     r
 }
@@ -2072,5 +2105,24 @@ mod tests {
         let mut bad = file.clone();
         bad[3] = 0xC8;
         assert_eq!(refused(&bad), LoadError::new("unknown marker"));
+
+        // Huffman `-1` return when a marker stops `grow_buffer_unsafe` early clamps `code_bits >= 0`.
+        let mut h = Huffman::new();
+        h.fast.fill(255);
+        h.maxcode = [0; 18]; // `temp < h.maxcode[k]` never matches for `k in 10..=16`, reaching `k == 17`
+        let mut e = Entropy {
+            code_buffer: 0xffff_0000,
+            code_bits: 0,
+            marker: STBI_MARKER_NONE,
+            nomore: false,
+            spec_start: 0,
+            spec_end: 0,
+            succ_high: 0,
+            succ_low: 0,
+            eob_run: 0,
+        };
+        let mut ctx = Context::new(&[0xff, 0xd9], &options);
+        assert_eq!(jpeg_huff_decode(&mut e, &mut ctx, &h), -1);
+        assert_eq!(e.code_bits, 0);
     }
 }

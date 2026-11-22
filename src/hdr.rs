@@ -1,10 +1,177 @@
 //! The Radiance `.hdr` reader: `stbi__hdr_*`, originally by Nicolas Schulz; and the conversions
-//! between floats and 8 bits a channel, `stbi__hdr_to_ldr` and `stbi__ldr_to_hdr`.
+//! between floats and 8/16 bits a channel, `stbi__hdr_to_ldr` and `stbi__ldr_to_hdr`.
+
+use alloc::vec::Vec;
 
 use super::{
     Context, Failed, ImageFormat, LoadOptions, RawInfo, STBI_MAX_DIMENSIONS, mad3sizes_valid,
-    mad4sizes_valid,
+    mad4sizes_valid, try_alloc_zeroed,
 };
+
+#[cfg(feature = "std")]
+#[inline]
+fn powf64(base: f64, exp: f64) -> f64 {
+    base.powf(exp)
+}
+
+#[cfg(not(feature = "std"))]
+#[inline]
+fn powf64(base: f64, exp: f64) -> f64 {
+    powf64_nostd(base, exp)
+}
+
+/// Integer test for negative-base / signed-zero IEEE-754 rules: returns 0 if not an integer,
+/// 1 if an even integer, 2 if an odd integer.
+#[cfg_attr(feature = "std", allow(dead_code))]
+fn int_parity(val: f64) -> u8 {
+    if !val.is_finite() {
+        return 0;
+    }
+    let bits = val.to_bits() & 0x7fff_ffff_ffff_ffff;
+    if bits == 0 {
+        return 1;
+    }
+    let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    if exp < 0 {
+        return 0;
+    }
+    if exp >= 53 {
+        return 1; // 2^53 and higher are always even integers
+    }
+    let frac_bits = 52 - exp;
+    let mant = (bits & 0x000f_ffff_ffff_ffff) | (1u64 << 52);
+    if frac_bits > 0 && (mant & ((1u64 << frac_bits) - 1)) != 0 {
+        return 0;
+    }
+    if ((mant >> frac_bits) & 1) != 0 { 2 } else { 1 }
+}
+
+#[cfg_attr(feature = "std", allow(dead_code))]
+#[allow(clippy::float_cmp)]
+fn ldexp64(mut val: f64, mut exp: i32) -> f64 {
+    if val == 0.0 || !val.is_finite() {
+        return val;
+    }
+    while exp > 1023 {
+        val *= f64::from_bits(2046u64 << 52); // 2^1023
+        exp -= 1023;
+        if !val.is_finite() {
+            return val;
+        }
+    }
+    while exp < -1022 {
+        val *= f64::from_bits(1u64 << 52); // 2^-1022
+        exp += 1022;
+        if val == 0.0 {
+            return val;
+        }
+    }
+    val * f64::from_bits(((exp + 1023) as u64) << 52)
+}
+
+/// Pure-Rust IEEE-754 `f64::powf` fallback for `#![no_std]` builds.
+#[cfg_attr(feature = "std", allow(dead_code))]
+#[allow(clippy::float_cmp)]
+fn powf64_nostd(mut base: f64, exp: f64) -> f64 {
+    if exp == 0.0 || base == 1.0 {
+        return 1.0;
+    }
+    if base.is_nan() || exp.is_nan() {
+        return f64::NAN;
+    }
+    if base == 0.0 {
+        let sign = if base.is_sign_negative() && int_parity(exp) == 2 {
+            -1.0
+        } else {
+            1.0
+        };
+        return if exp < 0.0 {
+            sign * f64::INFINITY
+        } else {
+            sign * 0.0
+        };
+    }
+
+    let mut sign = 1.0;
+    if base < 0.0 {
+        match int_parity(exp) {
+            0 => return f64::NAN,
+            2 => sign = -1.0,
+            _ => {}
+        }
+        base = -base;
+    }
+    if base.is_infinite() {
+        return sign * if exp > 0.0 { f64::INFINITY } else { 0.0 };
+    }
+    if exp.is_infinite() {
+        if base == 1.0 {
+            return 1.0;
+        }
+        return if (base > 1.0) == (exp > 0.0) {
+            f64::INFINITY
+        } else {
+            0.0
+        };
+    }
+
+    // Decompose base = mant * 2^exp2_base with mant in [sqrt(2)/2, sqrt(2)].
+    let mut exp2_base = 0i32;
+    if (base.to_bits() & 0x7ff0_0000_0000_0000) == 0 {
+        base *= 4_503_599_627_370_496.0; // 2^52 to normalize subnormals
+        exp2_base -= 52;
+    }
+    let bits = base.to_bits();
+    exp2_base += ((bits >> 52) & 0x7ff) as i32 - 1023;
+    let mut mant = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | (1023u64 << 52));
+    if mant > core::f64::consts::SQRT_2 {
+        mant *= 0.5;
+        exp2_base += 1;
+    }
+
+    // ln(mant) = 2 * ratio * sum_{j=0..10} ratio^(2j) / (2j + 1), |ratio| < 0.1716.
+    let ratio = (mant - 1.0) / (mant + 1.0);
+    let ratio2 = ratio * ratio;
+    let mut poly = 1.0 / 21.0;
+    for &denom in &[19.0, 17.0, 15.0, 13.0, 11.0, 9.0, 7.0, 5.0, 3.0, 1.0] {
+        poly = poly * ratio2 + 1.0 / denom;
+    }
+    let ln_m = 2.0 * ratio * poly;
+
+    let exp2_total = exp * (f64::from(exp2_base) + ln_m * core::f64::consts::LOG2_E);
+    if exp2_total > 1024.0 {
+        return sign * f64::INFINITY;
+    }
+    if exp2_total < -1075.0 {
+        return sign * 0.0;
+    }
+
+    // Range reduce exp2_total = exp2_out + rem2 with |rem2| <= 0.5 (exact by Sterbenz's lemma).
+    let exp2_out = (if exp2_total >= 0.0 {
+        exp2_total + 0.5
+    } else {
+        exp2_total - 0.5
+    }) as i32;
+    let rem = (exp2_total - f64::from(exp2_out)) * core::f64::consts::LN_2;
+
+    let mut exp_r = 1.0 / 6_227_020_800.0; // 1 / 13!
+    for idx in (1..=12).rev() {
+        exp_r = exp_r * rem + 1.0 / factorial(idx);
+    }
+    exp_r = exp_r * rem + 1.0;
+
+    sign * ldexp64(exp_r, exp2_out)
+}
+
+const fn factorial(n: u32) -> f64 {
+    let mut acc = 1u64;
+    let mut i = 2u32;
+    while i <= n {
+        acc *= i as u64;
+        i += 1;
+    }
+    acc as f64
+}
 
 /// `stbi__hdr_test_core`
 fn hdr_test_core(s: &mut Context, signature: &[u8]) -> bool {
@@ -278,12 +445,24 @@ pub(crate) fn hdr_load(s: &mut Context, mut req_comp: i32) -> Option<(Vec<f32>, 
         return s.errp("too large");
     }
 
+    let len = (width * height * req_comp) as usize;
+    if s.check_limits(width as u32, height as u32, len * 4)
+        .is_err()
+    {
+        return None;
+    }
+
     // Read data
-    let mut hdr_data = vec![0.0f32; (width * height * req_comp) as usize];
+    let Some(mut hdr_data) = try_alloc_zeroed::<f32>(len) else {
+        return s.errp("outofmem");
+    };
 
     // for sizes where it's legal, assume RLE unless proven otherwise
     let isrle = (8..32768).contains(&width);
-    let mut scanline = vec![0u8; if isrle { width as usize * 4 } else { 0 }];
+    let Some(mut scanline) = try_alloc_zeroed::<u8>(if isrle { width as usize * 4 } else { 0 })
+    else {
+        return s.errp("outofmem");
+    };
 
     if hdr_load_pixels(
         s,
@@ -355,16 +534,23 @@ pub(crate) fn hdr_to_ldr(
     if !mad3sizes_valid(x, y, comp, 0) {
         return s.errp("outofmem");
     }
+    let len = x as usize * y as usize * comp as usize;
+    if s.check_limits(x as u32, y as u32, len).is_err() {
+        return None;
+    }
     // (The original keeps the reciprocals.)
     let gamma_i = 1.0f32 / options.hdr_to_ldr_gamma;
     let scale_i = 1.0f32 / options.hdr_to_ldr_scale;
     let comp = comp as usize;
-    let mut output = vec![0u8; x as usize * y as usize * comp];
+    let Some(mut output) = try_alloc_zeroed::<u8>(len) else {
+        return s.errp("outofmem");
+    };
     // compute number of non-alpha components
     let n = if comp & 1 != 0 { comp } else { comp - 1 };
     for (pixel, out) in data.chunks_exact(comp).zip(output.chunks_exact_mut(comp)) {
         for k in 0..n {
-            let z = (f64::from(pixel[k] * scale_i).powf(f64::from(gamma_i)) as f32) * 255.0 + 0.5;
+            let z =
+                (powf64(f64::from(pixel[k] * scale_i), f64::from(gamma_i)) as f32) * 255.0 + 0.5;
             out[k] = float_to_u8(z);
         }
         if n < comp {
@@ -390,6 +576,9 @@ fn float_to_u8(mut z: f32) -> u8 {
 
 /// `stbi__ldr_to_hdr`: 8 bits a channel to floats, by [`LoadOptions::ldr_to_hdr_gamma`] and
 /// [`LoadOptions::ldr_to_hdr_scale`]; alpha in a straight line.
+///
+/// Uses a 256-entry `f32` lookup table computed with the exact IEEE-754 expression of the
+/// original (`(f64::from(f32::from(v) / 255.0).powf(gamma) * scale) as f32`).
 pub(crate) fn ldr_to_hdr(
     s: &mut Context,
     data: &[u8],
@@ -402,17 +591,73 @@ pub(crate) fn ldr_to_hdr(
         return s.errp("outofmem");
     }
     let comp = comp as usize;
-    let mut output = vec![0.0f32; x as usize * y as usize * comp];
+    let len = x as usize * y as usize * comp;
+    if s.check_limits(x as u32, y as u32, len * 4).is_err() {
+        return None;
+    }
+    let Some(mut output) = try_alloc_zeroed::<f32>(len) else {
+        return s.errp("outofmem");
+    };
+
+    let gamma = f64::from(options.ldr_to_hdr_gamma);
+    let scale = f64::from(options.ldr_to_hdr_scale);
+    let mut lut = [0.0f32; 256];
+    for (v, entry) in lut.iter_mut().enumerate() {
+        *entry = (powf64(f64::from(f32::from(v as u8) / 255.0), gamma) * scale) as f32;
+    }
+
     // compute number of non-alpha components
+    let n = if comp & 1 != 0 { comp } else { comp - 1 };
+    if n == comp {
+        for (&byte, out) in data.iter().zip(&mut output) {
+            *out = lut[usize::from(byte)];
+        }
+    } else {
+        let mut alpha_lut = [0.0f32; 256];
+        for (v, entry) in alpha_lut.iter_mut().enumerate() {
+            *entry = f32::from(v as u8) / 255.0;
+        }
+        for (pixel, out) in data.chunks_exact(comp).zip(output.chunks_exact_mut(comp)) {
+            for k in 0..n {
+                out[k] = lut[usize::from(pixel[k])];
+            }
+            out[n] = alpha_lut[usize::from(pixel[n])];
+        }
+    }
+    Some(output)
+}
+
+/// Converts 16-bit samples (`0..=65535`) directly to floats for
+/// [`LoadOptions::preserve_16bit_in_f32`].
+pub(crate) fn ldr_16_to_hdr(
+    s: &mut Context,
+    data: &[u16],
+    x: i32,
+    y: i32,
+    comp: i32,
+    options: &LoadOptions,
+) -> Option<Vec<f32>> {
+    if !mad4sizes_valid(x, y, comp, 4, 0) {
+        return s.errp("outofmem");
+    }
+    let comp = comp as usize;
+    let len = x as usize * y as usize * comp;
+    if s.check_limits(x as u32, y as u32, len * 4).is_err() {
+        return None;
+    }
+    let Some(mut output) = try_alloc_zeroed::<f32>(len) else {
+        return s.errp("outofmem");
+    };
+
+    let gamma = f64::from(options.ldr_to_hdr_gamma);
+    let scale = f64::from(options.ldr_to_hdr_scale);
     let n = if comp & 1 != 0 { comp } else { comp - 1 };
     for (pixel, out) in data.chunks_exact(comp).zip(output.chunks_exact_mut(comp)) {
         for k in 0..n {
-            out[k] = (f64::from(f32::from(pixel[k]) / 255.0)
-                .powf(f64::from(options.ldr_to_hdr_gamma))
-                * f64::from(options.ldr_to_hdr_scale)) as f32;
+            out[k] = (powf64(f64::from(f32::from(pixel[k]) / 65535.0), gamma) * scale) as f32;
         }
         if n < comp {
-            out[n] = f32::from(pixel[n]) / 255.0;
+            out[n] = f32::from(pixel[n]) / 65535.0;
         }
     }
     Some(output)
@@ -421,7 +666,8 @@ pub(crate) fn ldr_to_hdr(
 #[cfg(test)]
 mod tests {
     use super::super::{ImageFormat, LoadOptions, info, is_hdr, load, load_f32};
-    use super::strtol;
+    use super::{ldr_to_hdr, powf64_nostd, strtol};
+    use alloc::vec::Vec;
 
     #[test]
     fn numbers_are_read_as_strtol_reads_them() {
@@ -430,6 +676,46 @@ mod tests {
         assert_eq!(strtol(b"+X 5", 0), (0, 0));
         assert_eq!(strtol(b"99999999999999999999", 0), (i64::MAX, 20));
         assert_eq!(strtol(b"-9223372036854775808", 0), (i64::MIN, 20));
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn ldr_to_hdr_lut_and_nostd_powf_are_accurate() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        for gamma in [1.0f32, 1.8, 2.2, 2.4] {
+            for scale in [0.5f32, 1.0, 2.0, 4.0] {
+                let opts = LoadOptions {
+                    ldr_to_hdr_gamma: gamma,
+                    ldr_to_hdr_scale: scale,
+                    ..LoadOptions::default()
+                };
+                let mut ctx = crate::Context::new(&[], &opts);
+                let out = ldr_to_hdr(&mut ctx, &bytes, 64, 1, 4, &opts).unwrap();
+                for (px_idx, chunk) in out.as_chunks::<4>().0.iter().enumerate() {
+                    for k in 0..3 {
+                        let v = bytes[px_idx * 4 + k];
+                        let std_bits = ((f64::from(f32::from(v) / 255.0).powf(f64::from(gamma))
+                            * f64::from(scale)) as f32)
+                            .to_bits();
+                        let nostd_bits =
+                            ((powf64_nostd(f64::from(f32::from(v) / 255.0), f64::from(gamma))
+                                * f64::from(scale)) as f32)
+                                .to_bits();
+                        assert_eq!(chunk[k].to_bits(), std_bits);
+                        assert!(
+                            chunk[k].to_bits().abs_diff(nostd_bits) <= 1,
+                            "nostd powf differed for v={v}, gamma={gamma}, scale={scale}"
+                        );
+                    }
+                    let a = bytes[px_idx * 4 + 3];
+                    assert_eq!(chunk[3].to_bits(), (f32::from(a) / 255.0).to_bits());
+                }
+            }
+        }
+        assert!(powf64_nostd(-2.0, 1.0 / 2.2).is_nan());
+        assert_eq!(powf64_nostd(-2.0, 3.0), -8.0);
+        assert_eq!(powf64_nostd(0.0, 0.0), 1.0);
+        assert_eq!(powf64_nostd(0.0, 2.2), 0.0);
     }
 
     #[test]

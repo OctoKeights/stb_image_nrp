@@ -6,26 +6,34 @@
 
 - [Reading images](#reading-images)
 - [Channels](#channels)
-- [Options](#options)
+- [Options and limits](#options-and-limits)
+- [EXIF orientation](#exif-orientation)
 - [Animated GIFs](#animated-gifs)
 - [Information without pixels](#information-without-pixels)
 - [Errors](#errors)
+- [Cargo features](#cargo-features)
 - [zlib](#zlib)
 - [Correspondence with stb_image.h](#correspondence-with-stb_imageh)
 - [Differences from stb_image.h](#differences-from-stb_imageh)
 
 ## Reading images
 
-Three functions read an image, each recognising the format from the file's contents:
+Three functions read an image from a byte slice, each recognising the format from the file's
+contents:
 
 | Function | Values | Conversion |
 |---|---|---|
 | `load` | `u8` | 16-bit files are reduced to 8 bits, HDR files tone-mapped with `hdr_to_ldr_gamma` and `hdr_to_ldr_scale` |
 | `load_16` | `u16` | 8-bit files are widened, each value repeated as its low byte |
-| `load_f32` | `f32` | HDR files as they are; others through 8 bits, linearised with `ldr_to_hdr_gamma` and `ldr_to_hdr_scale` |
+| `load_f32` | `f32` | HDR files as they are; others through 8 bits (or 16 bits when `preserve_16bit_in_f32` is set), linearised with `ldr_to_hdr_gamma` and `ldr_to_hdr_scale` |
+
+With the default `std` feature enabled, `load_from_read`, `load_16_from_read`, and
+`load_f32_from_read` read from any `std::io::Read`, while `load_file` and `info_file` read
+from a filesystem path.
 
 Each returns an `Image`: its `width` and `height`, the `channels` of its `data`, the
-`channels_in_file`, and the values row by row from the top.
+`channels_in_file`, and the values row by row from the top (`as_bytes` on `Image<u8>`, plus
+`row`, `rows`, and `pixel`).
 
 ```rust
 use stb_image_nrp::{Channels, LoadOptions, load_f32};
@@ -39,13 +47,14 @@ assert_eq!(image.data, [1.0]);
 ## Channels
 
 The second argument chooses the channels of the result: `None` for the file's, or
-`Some(channels)` to convert. Grey is expanded to RGB by repetition; RGB is reduced to grey by
-the original's weighted sum, `(77 r + 150 g + 29 b) / 256`; and alpha, where added, is
-opaque.
+`Some(channels)` to convert. `Channels` converts to and from `1..=4` via `u8::from` and
+`Channels::try_from`. Grey is expanded to RGB by repetition; RGB is reduced to grey by the
+original's weighted sum, `(77 r + 150 g + 29 b) / 256`; and alpha, where added, is opaque.
 
-## Options
+## Options and limits
 
-`LoadOptions` holds the settings the original keeps in globals:
+`LoadOptions` holds the settings the original keeps in globals, together with opt-in bounds
+and post-processing flags (all configurable via `LoadOptions::new().with_*` builders):
 
 | Field | Default | Effect |
 |---|---|---|
@@ -54,6 +63,16 @@ opaque.
 | `unpremultiply` | `false` | With the above, divide an iPhone PNG's colours by its alpha |
 | `hdr_to_ldr_gamma`, `hdr_to_ldr_scale` | 2.2, 1.0 | How `load` and `load_16` tone-map HDR files |
 | `ldr_to_hdr_gamma`, `ldr_to_hdr_scale` | 2.2, 1.0 | How `load_f32` linearises other files |
+| `max_width`, `max_height` | `None` | Refuse images wider or taller than the limit before allocating |
+| `max_alloc_bytes` | `None` | Refuse decoded pixel buffers larger than the byte limit |
+| `preserve_16bit_in_f32` | `false` | Linearise 16-bit PNG, PSD, and PNM files directly from `0..=65535` in `load_f32` |
+| `apply_exif_orientation` | `false` | Apply JPEG `APP1` / PNG `eXIf` orientation (`1..=8`) before returning |
+
+## EXIF orientation
+
+`exif_orientation(bytes)` extracts the EXIF `Orientation` tag (`1..=8`) from JPEG `APP1` or
+PNG `eXIf` chunks without decoding the pixels, and `Image::apply_orientation` transforms an
+already-decoded `Image` in place.
 
 ## Animated GIFs
 
@@ -79,8 +98,21 @@ those questions alone.
 ## Errors
 
 A file that cannot be read gives a `LoadError`, whose `reason` is the original's short
-description, such as `"bad zlib header"` or `"too large"`. Where the original fails without
-setting a reason, the reason is empty, or the one an earlier step of the same call set.
+description (such as `"bad zlib header"` or `"too large"`) and whose `kind` classifies the
+failure into `ErrorKind` (`UnknownFormat`, `Unsupported`, `TooLarge`, `OutOfMemory`,
+`UnexpectedEof`, `InvalidInput`, or `CorruptData`). Where the original fails without setting
+a reason, `reason` is empty, or the one an earlier step of the same call set. Matching
+`stb_image.h`, `info` reports `"unknown image type"` whenever no format header succeeds, and
+`load_f32` reports `"unknown image type"` when a non-HDR file's 8-bit decode fails.
+
+## Cargo features
+
+- `std` *(enabled by default)*: enables `load_from_read`, `load_16_from_read`,
+  `load_f32_from_read`, `load_file`, `info_file`, and `std`'s `f64::powf`. Disable default
+  features for `#![no_std]` environments with `alloc`.
+- `fast-zlib`: uses `libdeflate_nrp` to decompress valid RFC 1950 PNG `IDAT` streams at high
+  speed, falling back automatically to the built-in `stb_image` zlib decoder on iPhone
+  (`CgBI`) or damaged streams.
 
 ## zlib
 
@@ -94,18 +126,17 @@ checksum.
 | stb_image.h | stb_image_nrp |
 |---|---|
 | `stbi_load_from_memory(buffer, len, &x, &y, &comp, req_comp)` | `load(buffer, channels, &options)` |
-| `stbi_load_16_from_memory` | `load_16` |
-| `stbi_loadf_from_memory` | `load_f32` |
+| `stbi_load`, `stbi_load_from_callbacks` | `load_file`, `load_from_read` |
+| `stbi_load_16_from_memory`, `stbi_load_16_from_callbacks` | `load_16`, `load_16_from_read` |
+| `stbi_loadf_from_memory`, `stbi_loadf_from_callbacks` | `load_f32`, `load_f32_from_read` |
 | `stbi_load_gif_from_memory` | `load_gif` |
-| `stbi_info_from_memory`, `stbi_is_16_bit_from_memory`, `stbi_is_hdr_from_memory` | `info`, `is_16_bit`, `is_hdr` |
+| `stbi_info_from_memory`, `stbi_info`, `stbi_is_16_bit_from_memory`, `stbi_is_hdr_from_memory` | `info`, `info_file`, `is_16_bit`, `is_hdr` |
 | `stbi_failure_reason()` | `LoadError::reason` |
 | `stbi_set_flip_vertically_on_load` and the other settings | `LoadOptions` |
 | `stbi_zlib_decode_malloc`, `stbi_zlib_decode_noheader_malloc` | `zlib::decompress` |
 | `stbi_zlib_decode_buffer`, `stbi_zlib_decode_noheader_buffer` | `zlib::decompress_with_limit` |
 
 ## Differences from stb_image.h
-
-- **Memory only.** Files are read from a slice, not from a path, a `FILE` or callbacks.
 
 - **Settings per call.** The original's global settings are a `LoadOptions` passed to each
   call, so threads can read with different settings.
@@ -117,6 +148,6 @@ checksum.
 - **No uninitialised memory.** Where a damaged file leads the original to read memory it
   has not written, the port reads zeros.
 
-- **Positive heights from `info`.** For a BMP stored top row first, the original's
-  `stbi_info` reports a negative height while its loader reports a positive one; `info`
-  reports the positive height.
+- **Positive heights from `info` for top-down BMPs.** For a BMP stored top row first, the
+  original's `stbi_info` reports a negative height while its loader reports a positive one;
+  `info` reports the positive height.

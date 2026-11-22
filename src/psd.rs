@@ -5,7 +5,7 @@ use core::cmp::Ordering;
 
 use super::{
     Context, Failed, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, convert_format,
-    mad3sizes_valid,
+    convert_rgba_in_place, mad3sizes_valid, try_alloc_zeroed,
 };
 
 /// `stbi__psd_test`
@@ -156,6 +156,9 @@ pub(crate) fn psd_load(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixe
     if !mad3sizes_valid(4, w, h, 0) {
         return s.errp("too large");
     }
+    if w <= 0 || h <= 0 {
+        return s.errp("0-pixel image");
+    }
 
     // Create the destination image.
     let sixteen = compression == 0 && bitdepth == 16 && bpc == 16;
@@ -164,8 +167,16 @@ pub(crate) fn psd_load(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixe
     }
     let pixel_count = w * h;
     let pixels = pixel_count as usize;
-    let mut out = vec![0u8; if sixteen { 0 } else { 4 * pixels }];
-    let mut out16 = vec![0u16; if sixteen { 4 * pixels } else { 0 }];
+    let alloc_bytes = if sixteen { 8 * pixels } else { 4 * pixels };
+    if s.check_limits(w as u32, h as u32, alloc_bytes).is_err() {
+        return None;
+    }
+    let Some(mut out) = try_alloc_zeroed::<u8>(if sixteen { 0 } else { 4 * pixels }) else {
+        return s.errp("outofmem");
+    };
+    let Some(mut out16) = try_alloc_zeroed::<u16>(if sixteen { 4 * pixels } else { 0 }) else {
+        return s.errp("outofmem");
+    };
 
     // Finally, the image data.
     if compression != 0 {
@@ -268,7 +279,7 @@ pub(crate) fn psd_load(s: &mut Context, req_comp: i32, bpc: i32) -> Option<(Pixe
         Pixels::U16(out16)
     } else {
         if req_comp != 0 && req_comp != 4 {
-            out = convert_format(s, out, 4, req_comp, w as u32, h as u32)?;
+            convert_rgba_in_place(&mut out, req_comp as usize);
         }
         Pixels::U8(out)
     };
@@ -318,6 +329,8 @@ pub(crate) fn psd_info(s: &mut Context) -> Option<RawInfo> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::super::{LoadOptions, load, load_16};
 
     /// A PSD file of RGB, without the mode data, resources or reserved data.
@@ -368,5 +381,28 @@ mod tests {
         let image = load(&file, crate::ch(1), &LoadOptions::default()).unwrap();
         let (seven, nine) = (((7u32 * 77) >> 8) as u8, ((9u32 * 77) >> 8) as u8);
         assert_eq!(image.data, [seven, seven, seven, nine]);
+    }
+
+    #[test]
+    fn zero_or_negative_dimensions_are_refused() {
+        let opts = LoadOptions::default();
+        assert_eq!(
+            load(&psd(3, 0, 4, 8, 0, &[]), None, &opts)
+                .unwrap_err()
+                .reason(),
+            "0-pixel image"
+        );
+        assert_eq!(
+            load(&psd(3, 4, 0, 8, 0, &[]), None, &opts)
+                .unwrap_err()
+                .reason(),
+            "0-pixel image"
+        );
+        assert_eq!(
+            load(&psd(3, 0x8000_0001, 4, 8, 0, &[]), None, &opts)
+                .unwrap_err()
+                .reason(),
+            "too large"
+        );
     }
 }

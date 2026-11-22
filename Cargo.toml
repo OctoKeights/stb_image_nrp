@@ -1,6 +1,6 @@
 [package]
 name = "stb_image_nrp"
-description = "Image file readers in pure, safe Rust: a native port of stb_image.h (PNG, BMP, JPEG, GIF, TGA, PSD, PNM, HDR), bit-identical to it."
+description = "Image file readers in pure, safe Rust: a native port of stb_image.h (PNG, BMP, JPEG, GIF, TGA, PSD, PNM, HDR, PIC), bit-identical to it."
 version = "0.2.1"
 edition = "2024"
 rust-version = "1.100"
@@ -8,13 +8,23 @@ license = "MIT OR Unlicense"
 repository = "https://github.com/OctoKeights/stb_image_nrp"
 readme = "README.md"
 keywords = ["png", "jpeg", "image", "decoder", "stb"]
-categories = ["multimedia::images", "encoding"]
+categories = ["multimedia::images", "encoding", "no-std"]
+exclude = [".github/", "compare/", "clippy.toml", "rust-toolchain.toml"]
+
+[features]
+default = ["std"]
+std = []
+fast-zlib = ["dep:libdeflate_nrp"]
 
 [dependencies]
+libdeflate_nrp = { version = "0.3.0", optional = true, default-features = false }
 
 [dev-dependencies]
-miniz_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/miniz_nrp" }
-stb_image_write_nrp = { version = "0.2.0", git = "https://github.com/OctoKeights/stb_image_write_nrp" }
+miniz_nrp = "0.3.0"
+stb_image_write_nrp = "0.3.0"
+
+[profile.test]
+opt-level = 2
 
 [lints.rust]
 # No unsafe code in the library, its tests, examples or benchmarks.

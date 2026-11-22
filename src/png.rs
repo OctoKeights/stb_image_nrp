@@ -6,9 +6,11 @@
 //!   - avoids problem of streaming data between subsystems
 //!   - avoids explicit window management
 
+use alloc::vec::Vec;
+
 use super::{
     Context, Failed, ImageFormat, Pixels, RawInfo, STBI_MAX_DIMENSIONS, Sample, Scan,
-    convert_format, mad2sizes_valid, mad3sizes_valid, zlib,
+    convert_format, mad2sizes_valid, mad3sizes_valid, try_alloc_zeroed, try_with_capacity, zlib,
 };
 
 /// `stbi__pngchunk`
@@ -95,12 +97,14 @@ fn create_png_alpha_expand8(dest: &mut [u8], x: usize, img_n: i32) {
     }
 }
 
-/// `stbi__create_png_image_raw`: create the png data from post-deflated data
+/// `stbi__create_png_image_raw`: create the png data from post-deflated data, reusing
+/// `a.out` and `filter_buf` across interlaced passes when already allocated.
 // (One pass, step for step as stb_image's, its state shared throughout.)
 #[allow(clippy::too_many_lines)]
 fn create_png_image_raw(
     s: &mut Context,
     a: &mut Png,
+    filter_buf: &mut Vec<u8>,
     raw: &[u8],
     out_n: i32,
     (x, y): (u32, u32),
@@ -137,20 +141,59 @@ fn create_png_image_raw(
     // when one of them fails.)
     let (x, y, out_n_, img_n_) = (x as usize, y as usize, out_n as usize, img_n as usize);
     let img_width_bytes = img_width_bytes as usize;
-    let mut out8 = if depth == 16 {
-        Vec::new()
-    } else {
-        vec![0u8; x * y * out_n_]
-    };
-    let mut out16 = if depth == 16 {
-        vec![0u16; x * y * out_n_]
-    } else {
-        Vec::new()
+    let total_samples = x * y * out_n_;
+    s.check_limits(x as u32, y as u32, total_samples * bytes as usize)?;
+
+    // Reuse existing pass allocation in `a.out` if present (across Adam7 passes).
+    let prev = core::mem::replace(&mut a.out, Pixels::U8(Vec::new()));
+    let (mut out8, mut out16) = match (depth == 16, prev) {
+        (false, Pixels::U8(mut buf)) => {
+            if buf.len() < total_samples {
+                if buf.try_reserve_exact(total_samples - buf.len()).is_err() {
+                    return s.fail("outofmem");
+                }
+                buf.resize(total_samples, 0);
+            }
+            buf[..total_samples].fill(0);
+            (buf, Vec::new())
+        }
+        (true, Pixels::U16(mut buf)) => {
+            if buf.len() < total_samples {
+                if buf.try_reserve_exact(total_samples - buf.len()).is_err() {
+                    return s.fail("outofmem");
+                }
+                buf.resize(total_samples, 0);
+            }
+            buf[..total_samples].fill(0);
+            (Vec::new(), buf)
+        }
+        (false, _) => {
+            let Some(buf) = try_alloc_zeroed::<u8>(total_samples) else {
+                return s.fail("outofmem");
+            };
+            (buf, Vec::new())
+        }
+        (true, _) => {
+            let Some(buf) = try_alloc_zeroed::<u16>(total_samples) else {
+                return s.fail("outofmem");
+            };
+            (Vec::new(), buf)
+        }
     };
     let stride = x * out_n_;
 
-    // Allocate two scan lines worth of filter workspace buffer.
-    let mut filter_buf = vec![0u8; img_width_bytes * 2];
+    // Reuse two scan lines worth of filter workspace buffer across passes.
+    let filter_needed = img_width_bytes * 2;
+    if filter_buf.len() < filter_needed {
+        if filter_buf
+            .try_reserve_exact(filter_needed - filter_buf.len())
+            .is_err()
+        {
+            return s.fail("outofmem");
+        }
+        filter_buf.resize(filter_needed, 0);
+    }
+    filter_buf[..filter_needed].fill(0);
 
     // Filtering for low-bit-depth images
     if depth < 8 {
@@ -308,11 +351,13 @@ fn create_png_image_raw(
     if !all_ok {
         return Err(Failed);
     }
-    a.out = if depth == 16 {
-        Pixels::U16(out16)
+    if depth == 16 {
+        out16.truncate(total_samples);
+        a.out = Pixels::U16(out16);
     } else {
-        Pixels::U8(out8)
-    };
+        out8.truncate(total_samples);
+        a.out = Pixels::U8(out8);
+    }
     Ok(())
 }
 
@@ -347,6 +392,44 @@ fn spread<T: Copy>(whole: &mut [T], pass: &[T], img_x: usize, out_n: usize, plac
     }
 }
 
+const ADAM7_XORIG: [u32; 7] = [0, 4, 0, 2, 0, 1, 0];
+const ADAM7_YORIG: [u32; 7] = [0, 0, 4, 0, 2, 0, 1];
+const ADAM7_XSPC: [u32; 7] = [8, 8, 4, 4, 2, 2, 1];
+const ADAM7_YSPC: [u32; 7] = [8, 8, 8, 4, 4, 2, 2];
+
+/// Computes the exact expected decompressed scanline byte length for a PNG (either flat or
+/// Adam7-interlaced), returning `None` on arithmetic overflow.
+fn expected_png_raw_len(
+    img_x: u32,
+    img_y: u32,
+    img_n: i32,
+    depth: i32,
+    interlaced: bool,
+) -> Option<usize> {
+    let (n, d) = (img_n as usize, depth as usize);
+    if !interlaced {
+        let row = (img_x as usize).checked_mul(n)?.checked_mul(d)?.div_ceil(8);
+        return row.checked_add(1)?.checked_mul(img_y as usize);
+    }
+    let mut total = 0usize;
+    for p in 0..7 {
+        let x = (img_x
+            .wrapping_sub(ADAM7_XORIG[p])
+            .wrapping_add(ADAM7_XSPC[p] - 1))
+            / ADAM7_XSPC[p];
+        let y = (img_y
+            .wrapping_sub(ADAM7_YORIG[p])
+            .wrapping_add(ADAM7_YSPC[p] - 1))
+            / ADAM7_YSPC[p];
+        if x != 0 && y != 0 {
+            let row = (x as usize).checked_mul(n)?.checked_mul(d)?.div_ceil(8);
+            let pass_len = row.checked_add(1)?.checked_mul(y as usize)?;
+            total = total.checked_add(pass_len)?;
+        }
+    }
+    Some(total)
+}
+
 /// `stbi__create_png_image`
 fn create_png_image(
     s: &mut Context,
@@ -359,8 +442,17 @@ fn create_png_image(
 ) -> Result<(), Failed> {
     let bytes = if depth == 16 { 2 } else { 1 };
     let out_bytes = out_n * bytes;
+    let mut filter_buf = Vec::new();
     if !interlaced {
-        return create_png_image_raw(s, a, image_data, out_n, (s.img_x, s.img_y), (depth, color));
+        return create_png_image_raw(
+            s,
+            a,
+            &mut filter_buf,
+            image_data,
+            out_n,
+            (s.img_x, s.img_y),
+            (depth, color),
+        );
     }
 
     // de-interlacing
@@ -368,35 +460,68 @@ fn create_png_image(
         return s.fail("outofmem");
     }
     let (img_x, img_y, out_n_) = (s.img_x as usize, s.img_y as usize, out_n as usize);
+    let total_samples = img_x * img_y * out_n_;
+    s.check_limits(s.img_x, s.img_y, total_samples * bytes as usize)?;
     let mut whole = if depth == 16 {
-        Pixels::U16(vec![0; img_x * img_y * out_n_])
+        let Some(buf) = try_alloc_zeroed::<u16>(total_samples) else {
+            return s.fail("outofmem");
+        };
+        Pixels::U16(buf)
     } else {
-        Pixels::U8(vec![0; img_x * img_y * out_n_])
+        let Some(buf) = try_alloc_zeroed::<u8>(total_samples) else {
+            return s.fail("outofmem");
+        };
+        Pixels::U8(buf)
     };
     let mut image_data = image_data;
     for p in 0..7 {
-        let xorig = [0u32, 4, 0, 2, 0, 1, 0];
-        let yorig = [0u32, 0, 4, 0, 2, 0, 1];
-        let xspc = [8u32, 8, 4, 4, 2, 2, 1];
-        let yspc = [8u32, 8, 8, 4, 4, 2, 2];
-        // pass1_x[4] = 0, pass1_x[5] = 1, pass1_x[12] = 1
-        let x = (s.img_x.wrapping_sub(xorig[p]).wrapping_add(xspc[p] - 1)) / xspc[p];
-        let y = (s.img_y.wrapping_sub(yorig[p]).wrapping_add(yspc[p] - 1)) / yspc[p];
+        let x = (s
+            .img_x
+            .wrapping_sub(ADAM7_XORIG[p])
+            .wrapping_add(ADAM7_XSPC[p] - 1))
+            / ADAM7_XSPC[p];
+        let y = (s
+            .img_y
+            .wrapping_sub(ADAM7_YORIG[p])
+            .wrapping_add(ADAM7_YSPC[p] - 1))
+            / ADAM7_YSPC[p];
         if x != 0 && y != 0 {
             let img_len = ((((s.img_n as u32 * x * depth as u32) + 7) >> 3) + 1) * y;
-            create_png_image_raw(s, a, image_data, out_n, (x, y), (depth, color))?;
+            create_png_image_raw(
+                s,
+                a,
+                &mut filter_buf,
+                image_data,
+                out_n,
+                (x, y),
+                (depth, color),
+            )?;
             let place = Placement {
                 x: x as usize,
                 y: y as usize,
-                xorig: xorig[p] as usize,
-                yorig: yorig[p] as usize,
-                xspc: xspc[p] as usize,
-                yspc: yspc[p] as usize,
+                xorig: ADAM7_XORIG[p] as usize,
+                yorig: ADAM7_YORIG[p] as usize,
+                xspc: ADAM7_XSPC[p] as usize,
+                yspc: ADAM7_YSPC[p] as usize,
             };
             match (&mut whole, &a.out) {
-                (Pixels::U8(whole), Pixels::U8(pass)) => spread(whole, pass, img_x, out_n_, &place),
+                (Pixels::U8(whole), Pixels::U8(pass)) => {
+                    spread(
+                        whole,
+                        &pass[..place.x * place.y * out_n_],
+                        img_x,
+                        out_n_,
+                        &place,
+                    );
+                }
                 (Pixels::U16(whole), Pixels::U16(pass)) => {
-                    spread(whole, pass, img_x, out_n_, &place);
+                    spread(
+                        whole,
+                        &pass[..place.x * place.y * out_n_],
+                        img_x,
+                        out_n_,
+                        &place,
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -442,7 +567,11 @@ fn expand_png_palette(
         return s.fail("outofmem");
     }
     let pixel_count = pixel_count as usize;
-    let mut p = Vec::with_capacity(pixel_count * pal_img_n as usize);
+    let total_bytes = pixel_count * pal_img_n as usize;
+    s.check_limits(s.img_x, s.img_y, total_bytes)?;
+    let Some(mut p) = try_with_capacity::<u8>(total_bytes) else {
+        return s.fail("outofmem");
+    };
 
     if pal_img_n == 3 {
         for &index in &orig[..pixel_count] {
@@ -544,10 +673,6 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> Re
 
     check_png_header(s)?;
 
-    if scan == Scan::Type {
-        return Ok(());
-    }
-
     loop {
         let c = get_chunk_header(s);
         match c.kind {
@@ -604,6 +729,9 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> Re
                 }
                 if s.img_x == 0 || s.img_y == 0 {
                     return s.fail("0-pixel image");
+                }
+                if scan == Scan::Load {
+                    s.check_limits(s.img_x, s.img_y, 0)?;
                 }
                 if pal_img_n == 0 {
                     s.img_n = (if color & 2 != 0 { 3 } else { 1 }) + i32::from(color & 4 != 0);
@@ -738,17 +866,26 @@ fn parse_png_file(s: &mut Context, z: &mut Png, scan: Scan, req_comp: i32) -> Re
                 }
                 // initial guess for decoded data size to avoid unnecessary reallocs
                 let bpl = (s.img_x * z.depth as u32).div_ceil(8); // bytes per line, per component
-                let raw_len = bpl.wrapping_mul(s.img_y).wrapping_mul(s.img_n as u32) /* pixels */ .wrapping_add(s.img_y) /* filter mode per row */;
-                let expanded = match zlib::decode_for_png(&z.idata, raw_len, !z.is_iphone) {
-                    Ok(expanded) => expanded,
-                    Err(reason) => {
-                        // zlib should set error
-                        if let Some(reason) = reason {
-                            s.reason = reason;
+                let raw_len = bpl
+                    .wrapping_mul(s.img_y)
+                    .wrapping_mul(s.img_n as u32) /* pixels */
+                    .wrapping_add(s.img_y) /* filter mode per row */;
+                let expected_raw =
+                    expected_png_raw_len(s.img_x, s.img_y, s.img_n, z.depth, interlace != 0);
+                if let Some(expected) = expected_raw {
+                    s.check_limits(s.img_x, s.img_y, expected)?;
+                }
+                let expanded =
+                    match zlib::decode_for_png(&z.idata, raw_len, expected_raw, !z.is_iphone) {
+                        Ok(expanded) => expanded,
+                        Err(reason) => {
+                            // zlib should set error
+                            if let Some(reason) = reason {
+                                s.reason = reason;
+                            }
+                            return Err(Failed);
                         }
-                        return Err(Failed);
-                    }
-                };
+                    };
                 z.idata = Vec::new();
                 if (req_comp == s.img_n + 1 && req_comp != 3 && pal_img_n == 0) || has_trans {
                     s.img_out_n = s.img_n + 1;
@@ -872,6 +1009,7 @@ pub(crate) fn png_info(s: &mut Context) -> Option<RawInfo> {
 mod tests {
     use super::super::{LoadError, LoadOptions, info, is_16_bit, load, load_16};
     use super::*;
+    use alloc::vec;
     use miniz_nrp::{self as miniz, Level, crc32};
     use stb_image_write_nrp::{Channels, Image, PngFilter, WriteOptions, write_png};
 

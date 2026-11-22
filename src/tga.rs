@@ -1,8 +1,10 @@
 //! The TGA reader: `stbi__tga_*`, Targa Truevision, by Jonathan Dummer.
 
+use alloc::vec::Vec;
+
 use super::{
     Context, ImageFormat, RawInfo, STBI_MAX_DIMENSIONS, convert_format, mad3sizes_valid,
-    vertical_flip,
+    try_alloc_zeroed, vertical_flip,
 };
 
 /// `stbi__tga_get_comp`: returns `STBI_rgb` or whatever, 0 on error; with it, whether the pixels
@@ -178,10 +180,22 @@ pub(crate) fn tga_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
     }
 
     let (width, height, comp) = (tga_width as usize, tga_height as usize, tga_comp as usize);
-    let mut tga_data = vec![0u8; width * height * comp];
+    let total_bytes = width * height * comp;
 
     // skip to the data's starting position (offset usually = 0)
     s.skip(tga_offset);
+
+    if !tga_indexed && !tga_is_rle && !tga_rgb16 && s.remaining() < total_bytes {
+        return s.errp("premature EOF");
+    }
+    if s.check_limits(tga_width as u32, tga_height as u32, total_bytes)
+        .is_err()
+    {
+        return None;
+    }
+    let Some(mut tga_data) = try_alloc_zeroed::<u8>(total_bytes) else {
+        return s.errp("outofmem");
+    };
 
     if !tga_indexed && !tga_is_rle && !tga_rgb16 {
         for row in tga_data.chunks_exact_mut(width * comp) {
@@ -199,7 +213,10 @@ pub(crate) fn tga_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
             }
 
             s.skip(tga_palette_start);
-            tga_palette = vec![0u8; tga_palette_len as usize * comp];
+            let Some(pal_buf) = try_alloc_zeroed::<u8>(tga_palette_len as usize * comp) else {
+                return s.errp("outofmem");
+            };
+            tga_palette = pal_buf;
             if tga_rgb16 {
                 debug_assert_eq!(comp, 3);
                 for entry in tga_palette.chunks_exact_mut(comp) {
@@ -307,6 +324,9 @@ pub(crate) fn tga_load(s: &mut Context, req_comp: i32) -> Option<(Vec<u8>, i32)>
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::super::{LoadOptions, load};
 
     /// A TGA file of uncompressed true colour: the header, then the pixels.
@@ -341,5 +361,11 @@ mod tests {
         let file = tga(11, 4, 1, 8, 0x20, &[0x82, 50, 0x00, 60]);
         let image = load(&file, crate::ch(0), &LoadOptions::default()).unwrap();
         assert_eq!(image.data, [50, 50, 50, 60]);
+
+        // Uncompressed 32-bit TGA claiming 23,170 x 23,170 (~2.14 GB) on a tiny buffer fails
+        // immediately with `"premature EOF"` without allocating 2.14 GB.
+        let huge_truncated = tga(2, 23_170, 23_170, 32, 0x20, &[1, 2, 3, 4]);
+        let err = load(&huge_truncated, None, &LoadOptions::default()).unwrap_err();
+        assert_eq!(err.reason(), "premature EOF");
     }
 }
